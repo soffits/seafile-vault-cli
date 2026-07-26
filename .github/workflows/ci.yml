@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v9
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Pytest
+        run: uv run pytest
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v9
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Build artifacts
+        run: uv build
+      - name: Verify artifacts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          wheels = list(Path("dist").glob("seafile_vault_cli-*.whl"))
+          sdists = list(Path("dist").glob("seafile_vault_cli-*.tar.gz"))
+          if len(wheels) != 1 or len(sdists) != 1:
+              raise SystemExit("expected exactly one wheel and one sdist")
+
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              names = set(wheel.namelist())
+              if "seafile_vault_cli/SKILL.md" not in names:
+                  raise SystemExit("wheel is missing seafile_vault_cli/SKILL.md")
+              license_names = [name for name in names if name.endswith("/LICENSE") or name == "LICENSE"]
+              if not any(len(wheel.read(name)) > 30_000 for name in license_names):
+                  raise SystemExit("wheel is missing a complete LICENSE larger than 30KB")
+
+          with tarfile.open(sdists[0]) as sdist:
+              root = sdists[0].name.removesuffix(".tar.gz")
+              names = set(sdist.getnames())
+              for required in {f"{root}/SKILL.md", f"{root}/LICENSE"}:
+                  if required not in names:
+                      raise SystemExit(f"sdist is missing {required}")
+          PY
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: seafile-vault-cli-dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz

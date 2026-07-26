@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "seafile-vault-cli"
+version = "0.1.0"
+description = "Secure, non-interactive CLI for one token-scoped Seafile library"
+readme = "README.md"
+license = "AGPL-3.0-only"
+authors = [{ name = "Sakina" }]
+maintainers = [{ name = "Sakina" }]
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.25"]
+keywords = ["seafile", "cli", "vault", "mcp", "upload"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: System :: Archiving",
+]
+
+[project.urls]
+Homepage = "https://github.com/soffits/seafile-vault-cli"
+Repository = "https://github.com/soffits/seafile-vault-cli"
+Issues = "https://github.com/soffits/seafile-vault-cli/issues"
+Security = "https://github.com/soffits/seafile-vault-cli/security"
+
+[project.optional-dependencies]
+dev = ["build>=1.2", "pytest>=8", "ruff>=0.8"]
+mcp = ["mcp>=1.0"]
+
+[project.scripts]
+seafile-vault = "seafile_vault_cli.cli:main"
+seafile-vault-mcp = "seafile_vault_cli.mcp_server:main"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/SECURITY.md",
+    "/CONTRIBUTING.md",
+    "/SKILL.md",
+    "/.env.example",
+    "/pyproject.toml",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/seafile_vault_cli"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"SKILL.md" = "seafile_vault_cli/SKILL.md"
+"LICENSE" = "seafile_vault_cli/LICENSE"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
