@@ -13,10 +13,13 @@ The CLI is the primary product. The optional MCP server exposes the same narrow 
 - Rejects `.`, `..`, duplicate slashes, ASCII control characters, relative paths, root rename, root move, and root delete.
 - Does not implement glob or bulk delete.
 - Never overwrites uploads unless `--overwrite` or `overwrite=True` is explicit.
-- Constrains returned download and upload links to the configured `SEAFILE_SERVER_URL` origin.
-- Redacts repo tokens and token-bearing upload URLs from errors and result objects.
+- Constrains returned download and upload links to the configured `SEAFILE_SERVER_URL` origin. Temporary download and upload links are bearer-like secrets.
+- `download` obtains temporary download links internally and never returns or logs them.
+- Redacts repo tokens and token-bearing upload/download URLs from errors and result objects.
 - Produces deterministic JSON: successful data on stdout, structured errors on stderr.
 - Opens local upload sources once with symlink-safe flags, verifies the opened descriptor is a regular file, and uploads from that same descriptor for both single-request and chunked uploads.
+- Downloads stream through the configured `httpx` client, enforce `SEAFILE_MAX_READ_SIZE`, write through a mode-0600 temp file in the destination directory, fsync, and atomically publish only after the full response succeeds.
+- Plain `mkdir` rejects exact-name conflicts before creation and rejects Seafile implicit conflict renames. `mkdir --parents` walks path segments, skips exact existing directories, and fails on file collisions.
 
 ## Installation
 
@@ -70,8 +73,13 @@ Use `read_only` for inspection and `read_write` only for sessions that must crea
 ```bash
 seafile-vault repo-info
 seafile-vault list /
+seafile-vault list / --recursive --type file --compact
+seafile-vault stat /inbox/note.md
+seafile-vault download /inbox/note.md ./note.md
+seafile-vault download /inbox/note.md ./note.md --overwrite
 seafile-vault download-link /inbox/note.md
 seafile-vault mkdir /exports
+seafile-vault mkdir /exports/2026/july --parents
 seafile-vault rename /inbox/draft.md final.md
 seafile-vault rename /inbox/old-folder new-folder --dir
 seafile-vault move /inbox/final.md /exports
@@ -101,6 +109,36 @@ Upload modes:
 - `--no-resume` skips the server `uploadedBytes` query and starts chunked upload at offset 0.
 
 Result JSON for path uploads includes `upload_mode`. Chunked results also include safe metadata such as `chunk_size` in bytes, `chunks_sent`, `resumed_from`, `resume_supported`, `size`, `remote_path`, `overwrite`, `direct_origin:false`, and a sanitized final Seafile result. Token-bearing upload links and local paths are never included.
+
+Read syntax:
+
+```bash
+seafile-vault stat REMOTE_PATH
+seafile-vault download REMOTE_PATH LOCAL_FILE [--overwrite]
+seafile-vault list [REMOTE_DIR] [--recursive] [--type file|dir] [--compact]
+```
+
+`stat` is file metadata only and rejects root. A missing file returns structured `remote_not_found` JSON instead of `null` success.
+
+`download` is valid in `read_only` mode. It validates the same-origin temporary download link internally, streams to a unique temp file in the destination directory, checks `Content-Length` when present, enforces `SEAFILE_MAX_READ_SIZE` incrementally, and leaves any prior destination untouched on failure. The destination parent must be a real directory. Symlink destinations are always rejected. Existing destinations require `--overwrite`, and overwrite only replaces regular files.
+
+Download result JSON contains only non-sensitive metadata:
+
+```json
+{"local_name":"note.md","overwrite":false,"remote_path":"/inbox/note.md","sha256":"...","size":123}
+```
+
+`list --compact` keeps only normalized agent-safe directory data and omits modifier emails, lock fields, IDs, repo IDs, repo names, and other Seafile internals. Its data shape is:
+
+```json
+{"count":1,"entries":[{"mtime":1720000000,"name":"note.md","size":123,"type":"file"}],"path":"/inbox"}
+```
+
+Plain `mkdir /path` first lists the exact parent and fails if any file or directory already has the requested exact name. `mkdir --parents /a/b/c` returns concise metadata such as:
+
+```json
+{"created":["/a/b","/a/b/c"],"path":"/a/b/c","skipped":["/a"]}
+```
 
 ## JSON Contract
 
@@ -154,7 +192,7 @@ pipx install 'git+https://github.com/soffits/seafile-vault-cli.git#egg=seafile-v
 seafile-vault-mcp
 ```
 
-It exposes listing, metadata, text reads, same-origin download links, directory creation, rename, move, delete, text writes, and base64 uploads. It intentionally does not expose arbitrary local-path upload, because that would allow an MCP caller to upload files from the host filesystem.
+It exposes listing, metadata, text reads, same-origin download links, directory creation, rename, move, delete, text writes, and base64 uploads. It intentionally does not expose arbitrary local-path upload/download, because that would allow an MCP caller to read or write files on the host filesystem.
 
 MCP mutations enforce `SEAFILE_PERMISSION_MODE=read_write` exactly like the CLI.
 
@@ -163,9 +201,11 @@ MCP mutations enforce `SEAFILE_PERMISSION_MODE=read_write` exactly like the CLI.
 ```bash
 uv sync --extra dev
 uv run ruff check .
-uv run python -m pytest
+uv run python -m pytest -p no:cacheprovider
 uv build
 uv run seafile-vault --help
+uv run seafile-vault list --help
+uv run seafile-vault download --help
 uv run seafile-vault upload --help
 ```
 

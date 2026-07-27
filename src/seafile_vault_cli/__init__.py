@@ -8,6 +8,7 @@ from .client import (
     PathSecurityError,
     PermissionMode,
     PermissionModeError,
+    RemoteNotFoundError,
     SeafileVaultClient,
     SeafileVaultError,
     SizeLimitError,
@@ -21,9 +22,10 @@ __all__ = [
     "PathSecurityError",
     "PermissionMode",
     "PermissionModeError",
+    "RemoteNotFoundError",
     "SeafileVaultClient",
     "SeafileVaultError",
     "SizeLimitError",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

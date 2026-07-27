@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import ipaddress
 import math
 import os
@@ -66,6 +67,10 @@ class SizeLimitError(SeafileVaultError, ValueError):
 
 class LocalFileError(SeafileVaultError, ValueError):
     """Local upload source is invalid."""
+
+
+class RemoteNotFoundError(SeafileVaultError, FileNotFoundError):
+    """Remote path was not found."""
 
 
 class PermissionMode(StrEnum):
@@ -151,6 +156,15 @@ class LocalUpload:
 
     def close(self) -> None:
         os.close(self.fd)
+
+
+@dataclass
+class DownloadDestination:
+    parent_fd: int
+    name: str
+
+    def close(self) -> None:
+        os.close(self.parent_fd)
 
 
 class BoundedFileReader:
@@ -457,6 +471,13 @@ class SeafileVaultClient:
         except httpx.HTTPError as exc:
             raise SeafileVaultError(redact_secret(str(exc), self.repo_token, url)) from None
 
+    def _raise_stream_status(self, response: httpx.Response, context: str, *secrets_to_redact: str | None) -> None:
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError:
+            message = f"Seafile {context} HTTP {response.status_code}"
+            raise SeafileVaultError(redact_secret(message, self.repo_token, *secrets_to_redact)) from None
+
     def get_repo_info(self) -> dict[str, Any]:
         return self._request("GET", "repo-info/").json()
 
@@ -491,6 +512,13 @@ class SeafileVaultClient:
         if not isinstance(size, int) or isinstance(size, bool):
             raise SeafileVaultError("file-info response size was not an integer")
         return data
+
+    def stat_file(self, path: str) -> dict[str, Any]:
+        path = self._validate_non_root_path(path, "stat")
+        info = self._get_remote_file_info(path)
+        if info is None:
+            raise RemoteNotFoundError(f"remote file not found: {path}")
+        return info
 
     def _verify_remote_file_size(self, path: str, expected_size: int, *, allow_missing: bool = False) -> dict[str, Any] | None:
         info = self._get_remote_file_info(path)
@@ -558,12 +586,76 @@ class SeafileVaultClient:
             params["type"] = type_filter
         return self._request("GET", "dir/", params=params).json()
 
-    def create_directory(self, path: str) -> Any:
+    def _directory_entries(self, data: Any) -> list[dict[str, Any]]:
+        entries = data.get("dirent_list") if isinstance(data, dict) else data
+        if not isinstance(entries, list):
+            raise SeafileVaultError("directory listing response was not a list")
+        normalized = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                normalized.append(entry)
+        return normalized
+
+    def _entry_name(self, entry: dict[str, Any]) -> str | None:
+        name = entry.get("name") or entry.get("obj_name")
+        return name if isinstance(name, str) else None
+
+    def _entry_type(self, entry: dict[str, Any]) -> str | None:
+        raw = entry.get("type") or entry.get("obj_type")
+        if raw in {"dir", "d", "directory"}:
+            return "dir"
+        if raw in {"file", "f"}:
+            return "file"
+        return raw if isinstance(raw, str) else None
+
+    def _find_exact_child(self, parent: str, name: str) -> dict[str, Any] | None:
+        for entry in self._directory_entries(self.list_directory(parent)):
+            if self._entry_name(entry) == name:
+                return entry
+        return None
+
+    def _create_directory_unchecked(self, path: str, name: str) -> Any:
+        result = self._request("POST", "dir/", params={"path": path}, json={"operation": "mkdir"}).json()
+        if not isinstance(result, dict):
+            raise SeafileVaultError("directory create response was not an object")
+        reported_name = result.get("obj_name")
+        if not isinstance(reported_name, str) or not reported_name:
+            raise SeafileVaultError("directory create response did not include obj_name")
+        if reported_name != name:
+            try:
+                self.delete_path(f"{path.rpartition('/')[0] or '/'}/{reported_name}".replace("//", "/"), recursive=True)
+            except SeafileVaultError:
+                pass
+            raise SeafileVaultError("directory create response reported a different name")
+        return result
+
+    def create_directory(self, path: str, *, parents: bool = False) -> Any:
         self.require_read_write()
         path = self.validate_vault_path(path)
         if path == "/":
             raise PathSecurityError("cannot create root directory")
-        return self._request("POST", "dir/", params={"path": path}, json={"operation": "mkdir"}).json()
+        if parents:
+            created: list[str] = []
+            skipped: list[str] = []
+            current = "/"
+            for segment in path.strip("/").split("/"):
+                next_path = f"/{segment}" if current == "/" else f"{current}/{segment}"
+                entry = self._find_exact_child(current, segment)
+                if entry is not None:
+                    if self._entry_type(entry) != "dir":
+                        raise SeafileVaultError(f"remote path segment is not a directory: {next_path}")
+                    skipped.append(next_path)
+                else:
+                    self._create_directory_unchecked(next_path, segment)
+                    created.append(next_path)
+                current = next_path
+            return {"path": path, "created": created, "skipped": skipped}
+
+        parent, name = self._split_parent_name(path)
+        if self._find_exact_child(parent, name) is not None:
+            raise SeafileVaultError(f"remote path already exists: {path}")
+        result = self._create_directory_unchecked(path, name)
+        return result
 
     def _validate_non_root_path(self, path: str, operation: str) -> str:
         path = self.validate_vault_path(path)
@@ -626,10 +718,148 @@ class SeafileVaultClient:
         path = self.validate_vault_path(path)
         if path == "/":
             raise PathSecurityError("download link requires a file path")
-        data = self._request("GET", "download-link/", params={"path": path}).json()
+        url = self._url("download-link/")
+        try:
+            response = self.http.get(url, headers=self._headers, params={"path": path})
+        except httpx.HTTPError as exc:
+            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, url)) from None
+        if response.status_code == 404:
+            raise RemoteNotFoundError(f"remote file not found: {path}")
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:1000] if exc.response is not None else ""
+            status = exc.response.status_code if exc.response else "error"
+            raise SeafileVaultError(redact_secret(f"Seafile download-link HTTP {status}: {body}", self.repo_token, url)) from None
+        data = response.json()
         if not isinstance(data, str):
             raise SeafileVaultError("download-link response was not a string")
         return self.validate_download_url(data)
+
+    def _open_download_parent(self, local_path: str | os.PathLike[str]) -> DownloadDestination:
+        path = Path(local_path)
+        if not path.name:
+            raise LocalFileError("download destination must include a file name")
+        parent = path.parent
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        try:
+            parent_fd = os.open(parent, flags)
+        except OSError as exc:
+            raise LocalFileError(f"destination parent is not accessible: {exc.strerror or exc}") from None
+        try:
+            parent_stat = os.fstat(parent_fd)
+            if not stat.S_ISDIR(parent_stat.st_mode):
+                raise LocalFileError("destination parent must be a real directory")
+        except Exception:
+            os.close(parent_fd)
+            raise
+        return DownloadDestination(parent_fd=parent_fd, name=path.name)
+
+    def _validate_download_destination(self, destination: DownloadDestination, *, overwrite: bool) -> None:
+        try:
+            dst_lstat = os.stat(destination.name, dir_fd=destination.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise LocalFileError(f"destination is not accessible: {exc.strerror or exc}") from None
+        if stat.S_ISLNK(dst_lstat.st_mode):
+            raise LocalFileError("destination must not be a symlink")
+        if not overwrite:
+            raise LocalFileError("destination already exists; pass --overwrite to replace it")
+        if not stat.S_ISREG(dst_lstat.st_mode):
+            raise LocalFileError("destination overwrite target must be a regular file")
+
+    def _write_all(self, fd: int, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise LocalFileError("download destination write made no progress")
+            view = view[written:]
+
+    def download_file_path(self, remote_path: str, local_path: str | os.PathLike[str], *, overwrite: bool = False) -> dict[str, Any]:
+        remote_path = self._validate_non_root_path(remote_path, "download")
+        destination = self._open_download_parent(local_path)
+        fd: int | None = None
+        link: str | None = None
+        tmp_name: str | None = None
+        total = 0
+        digest = hashlib.sha256()
+        try:
+            self._validate_download_destination(destination, overwrite=overwrite)
+            link = self.get_download_link(remote_path)
+            tmp_name = f".{destination.name}.seafile-vault-{secrets.token_hex(16)}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(tmp_name, flags, 0o600, dir_fd=destination.parent_fd)
+            with self.http.stream("GET", link, follow_redirects=False) as resp:
+                self._raise_stream_status(resp, "download", link)
+                content_length = resp.headers.get("content-length")
+                declared_size: int | None = None
+                if content_length is not None:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError as exc:
+                        raise SeafileVaultError("download response content-length was not an integer") from exc
+                    if declared_size < 0:
+                        raise SeafileVaultError("download response content-length was negative")
+                    if declared_size > self.max_read_size:
+                        raise SizeLimitError(f"file exceeds max read size ({self.max_read_size} bytes)")
+                for chunk in resp.iter_bytes():
+                    if total + len(chunk) > self.max_read_size:
+                        raise SizeLimitError(f"file exceeds max read size ({self.max_read_size} bytes)")
+                    self._write_all(fd, chunk)
+                    total += len(chunk)
+                    digest.update(chunk)
+                if declared_size is not None and total != declared_size:
+                    raise SeafileVaultError("download response size did not match content-length")
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            if overwrite:
+                self._validate_download_destination(destination, overwrite=True)
+                os.replace(tmp_name, destination.name, src_dir_fd=destination.parent_fd, dst_dir_fd=destination.parent_fd)
+            else:
+                os.link(
+                    tmp_name,
+                    destination.name,
+                    src_dir_fd=destination.parent_fd,
+                    dst_dir_fd=destination.parent_fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(tmp_name, dir_fd=destination.parent_fd)
+            os.fsync(destination.parent_fd)
+            return {
+                "remote_path": remote_path,
+                "local_name": destination.name,
+                "size": total,
+                "sha256": digest.hexdigest(),
+                "overwrite": overwrite,
+            }
+        except httpx.HTTPError as exc:
+            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, link)) from None
+        except RemoteNotFoundError:
+            raise
+        except OSError as exc:
+            raise LocalFileError(f"download destination failed: {exc.strerror or exc}") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name, dir_fd=destination.parent_fd)
+                except FileNotFoundError:
+                    pass
+            destination.close()
 
     def validate_download_url(self, url: str) -> str:
         return self._validate_same_origin_url(url, "download")
@@ -659,13 +889,15 @@ class SeafileVaultClient:
         link = self.get_download_link(path)
         try:
             with self.http.stream("GET", link, follow_redirects=False) as resp:
-                resp.raise_for_status()
+                self._raise_stream_status(resp, "download", link)
                 content_length = resp.headers.get("content-length")
                 if content_length is not None:
                     try:
                         declared_size = int(content_length)
                     except ValueError as exc:
                         raise SeafileVaultError("download response content-length was not an integer") from exc
+                    if declared_size < 0:
+                        raise SeafileVaultError("download response content-length was negative")
                     if declared_size > self.max_read_size:
                         raise SizeLimitError(f"file exceeds max read size ({self.max_read_size} bytes)")
                 chunks: list[bytes] = []

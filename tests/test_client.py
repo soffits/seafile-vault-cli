@@ -1,7 +1,9 @@
 import base64
 import json
 import os
+import stat
 import subprocess
+from pathlib import Path
 from urllib.parse import unquote
 
 import httpx
@@ -16,7 +18,9 @@ from seafile_vault_cli.client import (
     PathSecurityError,
     PermissionMode,
     PermissionModeError,
+    RemoteNotFoundError,
     SeafileVaultClient,
+    SeafileVaultError,
     SizeLimitError,
 )
 
@@ -79,6 +83,313 @@ def test_download_link_calls_endpoint(httpx_mock_transport):
     assert requests[0].url.params["path"] == "/note.txt"
 
 
+def test_stat_file_calls_file_endpoint_and_not_found_is_error(httpx_mock_transport):
+    client, requests = httpx_mock_transport(json_body={"name": "note.txt", "size": 5})
+    assert client.stat_file("/note.txt") == {"name": "note.txt", "size": 5}
+    assert requests[0].url.path == "/api/v2.1/via-repo-token/file/"
+    assert requests[0].url.params["path"] == "/note.txt"
+
+    missing, _ = httpx_mock_transport(status_code=404, json_body={"detail": "missing"})
+    with pytest.raises(RemoteNotFoundError):
+        missing.stat_file("/missing.txt")
+    with pytest.raises(PathSecurityError):
+        client.stat_file("/")
+
+
+def test_download_file_path_streams_to_0600_temp_and_returns_hash(tmp_path):
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file-secret")
+        return httpx.Response(200, content=b"hello", headers={"content-length": "5"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        max_read_size=5,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    dest = tmp_path / "note.txt"
+    result = client.download_file_path("/note.txt", dest)
+    assert dest.read_bytes() == b"hello"
+    assert stat.S_IMODE(dest.stat().st_mode) == 0o600
+    assert result == {
+        "remote_path": "/note.txt",
+        "local_name": "note.txt",
+        "size": 5,
+        "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "overwrite": False,
+    }
+    assert str(requests[1].url) == "https://seafile.example.com/file-secret"
+
+
+def test_download_file_path_handles_partial_os_write(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=b"abcdef", headers={"content-length": "6"})
+
+    original_write = os.write
+    writes = []
+
+    def partial_write(fd, data):
+        chunk = bytes(data[:2])
+        written = original_write(fd, chunk)
+        writes.append(written)
+        return written
+
+    monkeypatch.setattr("seafile_vault_cli.client.os.write", partial_write)
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    dest = tmp_path / "note.txt"
+    result = client.download_file_path("/note.txt", dest)
+    assert dest.read_bytes() == b"abcdef"
+    assert result["size"] == 6
+    assert result["sha256"] == "bef57ec7f53a6d40beb640a780a639c83bc29ac8a9816f1fc6c5c6dcd93c4721"
+    assert writes == [2, 2, 2]
+
+
+def test_download_file_path_zero_os_write_fails_without_publish(tmp_path, monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=b"abc")
+
+    monkeypatch.setattr("seafile_vault_cli.client.os.write", lambda _fd, _data: 0)
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(LocalFileError, match="no progress"):
+        client.download_file_path("/note.txt", tmp_path / "note.txt")
+    assert not (tmp_path / "note.txt").exists()
+
+
+def test_download_file_path_overwrite_replaces_regular_file(tmp_path):
+    dest = tmp_path / "note.txt"
+    dest.write_text("old", encoding="utf-8")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=b"new", headers={"content-length": "3"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert client.download_file_path("/note.txt", dest, overwrite=True)["overwrite"] is True
+    assert dest.read_bytes() == b"new"
+
+
+def test_download_file_path_rejects_bad_destinations(tmp_path):
+    client = SeafileVaultClient("https://seafile.example.com", "super-secret-token")
+    with pytest.raises(LocalFileError):
+        client.download_file_path("/note.txt", tmp_path / "missing" / "note.txt")
+    with pytest.raises(LocalFileError, match="file name"):
+        client.download_file_path("/note.txt", "/")
+    with pytest.raises(LocalFileError):
+        client.download_file_path("/note.txt", tmp_path)
+    dest = tmp_path / "exists.txt"
+    dest.write_text("old", encoding="utf-8")
+    with pytest.raises(LocalFileError):
+        client.download_file_path("/note.txt", dest)
+    link = tmp_path / "link.txt"
+    link.symlink_to(dest)
+    with pytest.raises(LocalFileError):
+        client.download_file_path("/note.txt", link, overwrite=True)
+
+
+def test_download_file_path_rejects_special_destination_with_overwrite(tmp_path):
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    client = SeafileVaultClient("https://seafile.example.com", "super-secret-token")
+    with pytest.raises(LocalFileError):
+        client.download_file_path("/note.txt", fifo, overwrite=True)
+
+
+def test_download_file_path_closes_parent_fd_on_destination_validation_failure(tmp_path, monkeypatch):
+    dest = tmp_path / "exists.txt"
+    dest.write_text("old", encoding="utf-8")
+    original_close = os.close
+    closed_parent_fds = []
+
+    def close_spy(fd):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            target = None
+        if target is not None and Path(target) == tmp_path:
+            closed_parent_fds.append(fd)
+        original_close(fd)
+
+    monkeypatch.setattr(client_module.os, "close", close_spy)
+    client = SeafileVaultClient("https://seafile.example.com", "super-secret-token")
+
+    with pytest.raises(LocalFileError, match="already exists"):
+        client.download_file_path("/note.txt", dest)
+
+    assert len(closed_parent_fds) == 1
+
+
+def test_download_file_path_size_limit_content_length_leaves_existing_file(tmp_path):
+    dest = tmp_path / "note.txt"
+    dest.write_bytes(b"old")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=b"toolarge", headers={"content-length": "8"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        max_read_size=7,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SizeLimitError):
+        client.download_file_path("/note.txt", dest, overwrite=True)
+    assert dest.read_bytes() == b"old"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_download_file_path_negative_content_length_fails_and_cleans_temp(tmp_path):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=b"abc", headers={"content-length": "-1"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SeafileVaultError, match="negative"):
+        client.download_file_path("/note.txt", tmp_path / "note.txt")
+    assert not (tmp_path / "note.txt").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_download_file_path_size_limit_without_content_length_cleans_temp(tmp_path):
+    class ChunkStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b"abc"
+            yield b"def"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, stream=ChunkStream())
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        max_read_size=5,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SizeLimitError):
+        client.download_file_path("/note.txt", tmp_path / "note.txt")
+    assert not (tmp_path / "note.txt").exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_download_file_path_truncated_response_fails_without_corruption(tmp_path):
+    dest = tmp_path / "note.txt"
+    dest.write_bytes(b"old")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=b"new", headers={"content-length": "4"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SeafileVaultError, match="content-length"):
+        client.download_file_path("/note.txt", dest, overwrite=True)
+    assert dest.read_bytes() == b"old"
+
+
+def test_download_file_path_http_error_redacts_link(tmp_path):
+    link = "https://seafile.example.com/download/secret-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json=link)
+        return httpx.Response(500, text=f"failed {link}")
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SeafileVaultError) as exc:
+        client.download_file_path("/note.txt", tmp_path / "note.txt")
+    assert "secret-token" not in str(exc.value)
+    assert link not in str(exc.value)
+
+
+def test_download_file_path_streaming_http_error_does_not_read_or_leak_body(tmp_path):
+    link = "https://seafile.example.com/download/secret-token"
+
+    class ErrorStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield f"failed {link}".encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json=link)
+        return httpx.Response(500, stream=ErrorStream())
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SeafileVaultError) as exc:
+        client.download_file_path("/note.txt", tmp_path / "note.txt")
+    assert str(exc.value) == "Seafile download HTTP 500"
+    assert "secret-token" not in str(exc.value)
+    assert link not in str(exc.value)
+
+
+def test_download_file_path_missing_remote_raises_remote_not_found(tmp_path, monkeypatch):
+    original_close = os.close
+    closed_parent_fds = []
+
+    def close_spy(fd):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            target = None
+        if target is not None and Path(target) == tmp_path:
+            closed_parent_fds.append(fd)
+        original_close(fd)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v2.1/via-repo-token/download-link/"
+        return httpx.Response(404, json={"detail": "missing"})
+
+    monkeypatch.setattr(client_module.os, "close", close_spy)
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(RemoteNotFoundError, match="/missing.txt"):
+        client.download_file_path("/missing.txt", tmp_path / "missing.txt")
+    assert len(closed_parent_fds) == 1
+
+
 def test_read_text_bytes_and_base64_use_download_link_and_enforce_size():
     requests = []
 
@@ -117,6 +428,21 @@ def test_read_text_file_rejects_too_large_content_length():
         client.read_text_file("/note.txt")
 
 
+def test_read_file_bytes_rejects_negative_content_length():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=b"abc", headers={"content-length": "-1"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SeafileVaultError, match="negative"):
+        client.read_file_bytes("/note.txt")
+
+
 def test_read_file_bytes_streams_and_aborts_without_content_length():
     class ChunkStream(httpx.SyncByteStream):
         def __init__(self):
@@ -145,13 +471,143 @@ def test_read_file_bytes_streams_and_aborts_without_content_length():
     assert stream.sent == 2
 
 
-def test_create_directory_posts_mkdir_only(httpx_mock_transport):
-    client, requests = httpx_mock_transport(json_body={"success": True})
-    assert client.create_directory("/new") == {"success": True}
-    assert requests[0].method == "POST"
-    assert requests[0].url.path == "/api/v2.1/via-repo-token/dir/"
-    assert requests[0].url.params["path"] == "/new"
-    assert json.loads(requests[0].content) == {"operation": "mkdir"}
+def test_create_directory_checks_parent_before_mkdir():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={"success": True, "obj_name": "new"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        permission_mode=PermissionMode.READ_WRITE,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert client.create_directory("/new") == {"success": True, "obj_name": "new"}
+    assert requests[0].method == "GET"
+    assert requests[0].url.params["path"] == "/"
+    assert requests[1].method == "POST"
+    assert requests[1].url.path == "/api/v2.1/via-repo-token/dir/"
+    assert requests[1].url.params["path"] == "/new"
+    assert json.loads(requests[1].content) == {"operation": "mkdir"}
+
+
+def test_create_directory_rejects_existing_exact_name_file_or_dir():
+    for entry in ({"name": "new", "type": "dir"}, {"name": "new", "type": "file"}):
+        requests = []
+
+        def handler(request: httpx.Request, entry=entry, requests=requests) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=[entry])
+
+        client = SeafileVaultClient(
+            "https://seafile.example.com",
+            "super-secret-token",
+            permission_mode=PermissionMode.READ_WRITE,
+            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+        with pytest.raises(SeafileVaultError, match="already exists"):
+            client.create_directory("/new")
+        assert len(requests) == 1
+
+
+def test_create_directory_rejects_auto_rename_response_and_attempts_cleanup():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json={"dirent_list": []})
+        if request.method == "DELETE":
+            return httpx.Response(200, json="success")
+        return httpx.Response(200, json={"obj_name": "Housing (1)"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        permission_mode=PermissionMode.READ_WRITE,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SeafileVaultError, match="different name"):
+        client.create_directory("/Household/Housing")
+    assert requests[-1].method == "DELETE"
+    assert requests[-1].url.params["path"] == "/Household/Housing (1)"
+
+
+@pytest.mark.parametrize("json_body", [{}, {"obj_name": None}, {"success": True}, []])
+def test_create_directory_rejects_missing_or_invalid_response_name_without_cleanup(json_body):
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json=json_body)
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        permission_mode=PermissionMode.READ_WRITE,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(SeafileVaultError, match="obj_name|object"):
+        client.create_directory("/new")
+    assert [request.method for request in requests] == ["GET", "POST"]
+
+
+def test_create_directory_parents_walks_missing_levels_and_skips_existing_dirs():
+    listings = {
+        "/": [{"name": "a", "type": "dir"}],
+        "/a": [],
+        "/a/b": [],
+    }
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(200, json=listings.get(request.url.params["path"], []))
+        return httpx.Response(200, json={"obj_name": request.url.params["path"].rpartition("/")[2]})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        permission_mode=PermissionMode.READ_WRITE,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert client.create_directory("/a/b/c", parents=True) == {"path": "/a/b/c", "created": ["/a/b", "/a/b/c"], "skipped": ["/a"]}
+    assert [request.url.params["path"] for request in requests if request.method == "POST"] == ["/a/b", "/a/b/c"]
+
+
+def test_create_directory_parents_rejects_file_collision_read_only_and_root(httpx_mock_transport):
+    client, _ = httpx_mock_transport(json_body=[{"name": "a", "type": "file"}], permission_mode=PermissionMode.READ_WRITE)
+    with pytest.raises(SeafileVaultError, match="not a directory"):
+        client.create_directory("/a/b", parents=True)
+    read_only, _ = httpx_mock_transport(json_body=[] , permission_mode=PermissionMode.READ_ONLY)
+    with pytest.raises(PermissionModeError):
+        read_only.create_directory("/a", parents=True)
+    with pytest.raises(PathSecurityError):
+        client.create_directory("/", parents=True)
+
+
+def test_create_directory_parents_existing_path_creates_no_duplicates():
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"dirent_list": [{"obj_name": "a", "obj_type": "dir"}]})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        permission_mode=PermissionMode.READ_WRITE,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    assert client.create_directory("/a", parents=True) == {"path": "/a", "created": [], "skipped": ["/a"]}
+    assert all(request.method == "GET" for request in requests)
 
 
 def test_upload_text_default_non_overwrite_same_origin(httpx_mock_transport):

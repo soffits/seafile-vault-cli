@@ -12,6 +12,7 @@ from .client import (
     LocalFileError,
     PathSecurityError,
     PermissionModeError,
+    RemoteNotFoundError,
     SeafileVaultClient,
     SeafileVaultError,
     SizeLimitError,
@@ -41,11 +42,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list = sub.add_parser("list", help="List a vault directory")
     p_list.add_argument("path", nargs="?", default="/")
+    p_list.add_argument("--recursive", action="store_true", help="List recursively")
+    p_list.add_argument("--type", choices=("file", "dir"), help="Filter entries by type")
+    p_list.add_argument("--compact", action="store_true", help="Return agent-safe compact directory entries")
     sub.add_parser("repo-info", help="Show repo information")
     p_dl = sub.add_parser("download-link", help="Get a file download link")
     p_dl.add_argument("path")
+    p_download = sub.add_parser("download", help="Download a remote file to a local file")
+    p_download.add_argument("remote_path", metavar="REMOTE_PATH")
+    p_download.add_argument("local_file", metavar="LOCAL_FILE")
+    p_download.add_argument("--overwrite", action="store_true", help="Replace an existing local regular file")
+    p_stat = sub.add_parser("stat", help="Show remote file metadata")
+    p_stat.add_argument("path")
     p_mkdir = sub.add_parser("mkdir", help="Create a directory")
     p_mkdir.add_argument("path")
+    p_mkdir.add_argument("--parents", action="store_true", help="Create missing parent directories idempotently")
     p_rename = sub.add_parser("rename", help="Rename a file or directory")
     p_rename.add_argument("path")
     p_rename.add_argument("new_name")
@@ -98,18 +109,56 @@ def _dump_stderr(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")), file=sys.stderr)
 
 
+def _compact_list(path: str, data: Any) -> dict[str, Any]:
+    entries = data.get("dirent_list") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        raise SeafileVaultError("directory listing response was not a list")
+    compact_entries = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or entry.get("obj_name")
+        if not isinstance(name, str):
+            continue
+        raw_type = entry.get("type") or entry.get("obj_type")
+        if raw_type in {"d", "directory"}:
+            entry_type = "dir"
+        elif raw_type == "f":
+            entry_type = "file"
+        else:
+            entry_type = raw_type if raw_type in {"file", "dir"} else None
+        item: dict[str, Any] = {"name": name}
+        if entry_type is not None:
+            item["type"] = entry_type
+        size = entry.get("size")
+        if isinstance(size, int) and not isinstance(size, bool):
+            item["size"] = size
+        mtime = entry["mtime"] if "mtime" in entry else entry.get("last_modified")
+        if isinstance(mtime, (int, str)) and not isinstance(mtime, bool):
+            item["mtime"] = mtime
+        compact_entries.append(item)
+    return {"path": path, "count": len(compact_entries), "entries": compact_entries}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         with SeafileVaultClient.from_env() as client:
             if args.command == "list":
-                result = client.list_directory(args.path)
+                type_filter = {"file": "f", "dir": "d"}.get(args.type)
+                result = client.list_directory(args.path, recursive=args.recursive, type_filter=type_filter)
+                if args.compact:
+                    result = _compact_list(args.path, result)
             elif args.command == "repo-info":
                 result = client.get_repo_info()
             elif args.command == "download-link":
                 result = client.get_download_link(args.path)
+            elif args.command == "download":
+                result = client.download_file_path(args.remote_path, args.local_file, overwrite=args.overwrite)
+            elif args.command == "stat":
+                result = client.stat_file(args.path)
             elif args.command == "mkdir":
-                result = client.create_directory(args.path)
+                result = client.create_directory(args.path, parents=args.parents)
             elif args.command == "rename":
                 result = client.rename_path(args.path, args.new_name, is_directory=args.dir)
             elif args.command == "move":
@@ -143,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_SECURITY
     except SizeLimitError as exc:
         _dump_stderr(_error("size_limit", str(exc)))
+        return EXIT_SEAFILE
+    except RemoteNotFoundError as exc:
+        _dump_stderr(_error("remote_not_found", str(exc)))
         return EXIT_SEAFILE
     except SeafileVaultError as exc:
         name = type(exc).__name__.removesuffix("Error") or "SeafileVault"
