@@ -1,7 +1,7 @@
 ---
 name: seafile-vault-cli
 description: Use when operating one token-scoped Seafile library through Seafile Vault CLI or its optional MCP server.
-version: 0.1.0
+version: 0.2.0
 author: Sakina
 license: AGPL-3.0
 metadata:
@@ -25,8 +25,8 @@ The optional MCP server exposes the same narrow operations, but the CLI is the p
 ## When to Use
 
 - Inspect metadata for one configured library.
-- List explicit directories and read explicit files within size limits.
-- Generate same-origin download links returned by Seafile.
+- List explicit directories and read or download explicit files within size limits.
+- Generate same-origin download links returned by Seafile only when a caller explicitly needs the bearer-like temporary link.
 - Create, rename, move, delete, write, or upload explicit paths after enabling `read_write` for that process.
 - Upload large files with native Seafile multi-request chunked/resumable upload through the normal upload link.
 - Use direct-origin upload only as an optional fallback when the operator has already validated routing, TLS, firewall, and server upload limits.
@@ -94,10 +94,23 @@ Keep `SEAFILE_PERMISSION_MODE=read_only` for inspection:
 ```bash
 seafile-vault repo-info
 seafile-vault list /
+seafile-vault list / --recursive --type file --compact
+seafile-vault stat /path/file.md
+seafile-vault download /path/file.md ./file.md
 seafile-vault download-link /path/file.md
 ```
 
 Paths must be absolute normalized POSIX paths. Unicode is allowed. Relative paths, `.`, `..`, duplicate slashes, ASCII control characters, root file operations, and unsafe returned links are rejected.
+
+`download` is preferred over `download-link` for file retrieval. It obtains and validates the temporary same-origin link internally, never returns it, streams through the configured `httpx` client, enforces `SEAFILE_MAX_READ_SIZE`, writes through a mode-0600 temp file in the destination directory, and publishes only after the full response succeeds. Its JSON contains only `remote_path`, `local_name`, `size`, `sha256`, and `overwrite`.
+
+`stat` returns file metadata only. Missing files return structured `remote_not_found` JSON, not a successful `null` result.
+
+`list --compact` returns an agent-safe shape and omits modifier emails, lock fields, object IDs, repo IDs, repo names, and other internal metadata:
+
+```json
+{"count":1,"entries":[{"mtime":1720000000,"name":"file.md","size":123,"type":"file"}],"path":"/path"}
+```
 
 ## Mutation Workflow
 
@@ -105,6 +118,7 @@ Enable write mode only for the command or shell that needs it:
 
 ```bash
 SEAFILE_PERMISSION_MODE=read_write seafile-vault mkdir /exports
+SEAFILE_PERMISSION_MODE=read_write seafile-vault mkdir /exports/2026/july --parents
 SEAFILE_PERMISSION_MODE=read_write seafile-vault rename /inbox/draft.md final.md
 SEAFILE_PERMISSION_MODE=read_write seafile-vault move /inbox/final.md /exports
 SEAFILE_PERMISSION_MODE=read_write seafile-vault delete /exports/final.md
@@ -116,6 +130,8 @@ Uploads never overwrite unless `--overwrite` is explicit:
 SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./local.md /inbox/local.md
 SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./local.md /inbox/local.md --overwrite
 ```
+
+Plain `mkdir` never allows implicit Seafile conflict renames: it lists the exact parent first and fails if the requested exact child already exists as a file or directory. `mkdir --parents` walks each segment, skips exact existing directories, fails on file collisions, creates only missing segments, and returns `path`, `created`, and `skipped` metadata.
 
 ## Upload Procedure
 
@@ -167,7 +183,7 @@ Before delete or overwrite, list the exact parent directory and verify the targe
 - Single-request uploads can fail at a CDN or reverse proxy before reaching Seafile if request body limits are lower than the file size.
 - Use native chunked upload first for Cloudflare-safe large uploads; direct-origin is environment-specific fallback only.
 - Direct-origin upload still uses the Seafile hostname for Host and TLS/SNI; do not replace the upload URL host with an IP.
-- Token-bearing upload links are secrets; keep them out of argv, logs, issues, and examples.
+- Token-bearing upload and download links are bearer-like secrets; keep them out of argv, logs, issues, and examples.
 - Install `seafile-vault-cli[mcp]` before running `seafile-vault-mcp`; without the extra it exits with deterministic configuration JSON on stderr.
 
 ## Verification Checklist
@@ -177,9 +193,11 @@ For development or release checks:
 ```bash
 uv sync --extra dev
 uv run ruff check .
-uv run python -m pytest
+uv run python -m pytest -p no:cacheprovider
 uv build
 uv run seafile-vault --help
+uv run seafile-vault list --help
+uv run seafile-vault download --help
 uv run seafile-vault upload --help
 ```
 

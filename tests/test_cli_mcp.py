@@ -20,6 +20,8 @@ def test_cli_help_and_version_do_not_require_token():
     assert "seafile-vault" in help_result.stdout
     assert "repo-info" in help_result.stdout
     assert "upload" in help_result.stdout
+    assert "download" in help_result.stdout
+    assert "stat" in help_result.stdout
     version_result = subprocess.run(
         [sys.executable, "-m", "seafile_vault_cli.cli", "--version"],
         cwd=os.getcwd(),
@@ -54,6 +56,32 @@ def test_cli_rename_and_move_support_dir_selector():
     assert rename_args.dir is True
     move_args = build_parser().parse_args(["move", "/old", "/archive", "--dir"])
     assert move_args.dir is True
+
+
+def test_cli_list_parser_accepts_recursive_type_and_compact():
+    from seafile_vault_cli.cli import build_parser
+
+    args = build_parser().parse_args(["list", "/docs", "--recursive", "--type", "file", "--compact"])
+    assert args.command == "list"
+    assert args.path == "/docs"
+    assert args.recursive is True
+    assert args.type == "file"
+    assert args.compact is True
+
+
+def test_cli_download_stat_and_mkdir_parsers():
+    from seafile_vault_cli.cli import build_parser
+
+    download = build_parser().parse_args(["download", "/remote.txt", "local.txt", "--overwrite"])
+    assert download.command == "download"
+    assert download.remote_path == "/remote.txt"
+    assert download.local_file == "local.txt"
+    assert download.overwrite is True
+    stat_args = build_parser().parse_args(["stat", "/remote.txt"])
+    assert stat_args.command == "stat"
+    assert stat_args.path == "/remote.txt"
+    mkdir = build_parser().parse_args(["mkdir", "/a/b", "--parents"])
+    assert mkdir.parents is True
 
 
 def test_cli_upload_parser_defaults_to_no_overwrite():
@@ -154,6 +182,104 @@ def test_cli_json_success_envelope(monkeypatch, capsys):
     assert payload == {"ok": True, "data": {"remote_path": "/folder/remote.txt", "upload_mode": "auto"}}
 
 
+def test_cli_list_passes_options_and_compacts_metadata(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def list_directory(self, path, *, recursive, type_filter):
+            assert (path, recursive, type_filter) == ("/docs", True, "f")
+            return {
+                "repo_id": "secret-repo",
+                "dirent_list": [
+                    {
+                        "name": "a.txt",
+                        "type": "file",
+                        "size": 3,
+                        "mtime": 123,
+                        "modifier_email": "person@example.com",
+                        "lock_owner": "person@example.com",
+                        "id": "internal",
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    assert cli.main(["list", "/docs", "--recursive", "--type", "file", "--compact"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "ok": True,
+        "data": {"path": "/docs", "count": 1, "entries": [{"name": "a.txt", "type": "file", "size": 3, "mtime": 123}]},
+    }
+
+
+def test_cli_compact_list_preserves_zero_mtime_and_rejects_malformed_shape(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+
+    class FakeClient:
+        def __init__(self, result):
+            self.result = result
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def list_directory(self, path, *, recursive, type_filter):
+            return self.result
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient({"dirent_list": [{"name": "epoch.txt", "mtime": 0}]}))
+    assert cli.main(["list", "/docs", "--compact"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data"]["entries"] == [{"name": "epoch.txt", "mtime": 0}]
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient({"dirent_list": {}}))
+    assert cli.main(["list", "/docs", "--compact"]) == 6
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["error"]["code"] == "seafilevault"
+    assert "not a list" in payload["error"]["message"]
+
+
+def test_cli_download_stat_and_mkdir_json_calls(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+
+    calls = []
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def download_file_path(self, remote_path, local_file, *, overwrite):
+            calls.append(("download", remote_path, local_file, overwrite))
+            return {"remote_path": remote_path, "local_name": local_file, "overwrite": overwrite}
+
+        def stat_file(self, path):
+            calls.append(("stat", path))
+            return {"name": "remote.txt", "size": 1}
+
+        def create_directory(self, path, *, parents):
+            calls.append(("mkdir", path, parents))
+            return {"path": path, "created": [path], "skipped": []}
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    assert cli.main(["download", "/remote.txt", "local.txt", "--overwrite"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["overwrite"] is True
+    assert cli.main(["stat", "/remote.txt"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["size"] == 1
+    assert cli.main(["mkdir", "/a/b", "--parents"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["created"] == ["/a/b"]
+    assert calls == [("download", "/remote.txt", "local.txt", True), ("stat", "/remote.txt"), ("mkdir", "/a/b", True)]
+
+
 def test_cli_upload_json_passes_chunked_flags(monkeypatch, capsys):
     from seafile_vault_cli import cli
 
@@ -211,7 +337,7 @@ def test_cli_json_permission_error_envelope(monkeypatch, capsys):
         def __exit__(self, *_):
             return None
 
-        def create_directory(self, path):
+        def create_directory(self, path, *, parents=False):
             raise PermissionModeError("blocked")
 
     monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
@@ -255,6 +381,32 @@ def test_cli_stable_exit_code_mapping(monkeypatch, capsys):
     monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient(SeafileVaultError("remote failed")))
     assert cli.main(["repo-info"]) == 6
     assert json.loads(capsys.readouterr().err)["error"]["code"] == "seafilevault"
+
+
+def test_cli_remote_not_found_error_envelope(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+    from seafile_vault_cli.client import RemoteNotFoundError
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def stat_file(self, path):
+            raise RemoteNotFoundError(f"remote file not found: {path}")
+
+        def download_file_path(self, remote_path, local_file, *, overwrite):
+            raise RemoteNotFoundError(f"remote file not found: {remote_path}")
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    assert cli.main(["stat", "/missing.txt"]) == 6
+    payload = json.loads(capsys.readouterr().err)
+    assert payload == {"ok": False, "error": {"code": "remote_not_found", "message": "remote file not found: /missing.txt"}}
+    assert cli.main(["download", "/missing.txt", "local.txt"]) == 6
+    payload = json.loads(capsys.readouterr().err)
+    assert payload == {"ok": False, "error": {"code": "remote_not_found", "message": "remote file not found: /missing.txt"}}
 
 
 def test_mcp_server_module_importable():
