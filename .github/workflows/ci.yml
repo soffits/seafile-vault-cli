@@ -58,6 +58,13 @@ jobs:
               names = set(wheel.namelist())
               if "seafile_vault_cli/SKILL.md" not in names:
                   raise SystemExit("wheel is missing seafile_vault_cli/SKILL.md")
+              entry_point_names = [name for name in names if name.endswith(".dist-info/entry_points.txt")]
+              if len(entry_point_names) != 1:
+                  raise SystemExit("wheel is missing entry_points.txt")
+              entry_points = wheel.read(entry_point_names[0]).decode()
+              for script in {"seafile-vault", "seafile-library", "seafile-vault-mcp"}:
+                  if script not in entry_points:
+                      raise SystemExit(f"wheel is missing {script} entry point")
               license_names = [name for name in names if name.endswith("/LICENSE") or name == "LICENSE"]
               if not any(len(wheel.read(name)) > 30_000 for name in license_names):
                   raise SystemExit("wheel is missing a complete LICENSE larger than 30KB")

@@ -69,6 +69,18 @@ def test_cli_list_parser_accepts_recursive_type_and_compact():
     assert args.compact is True
 
 
+def test_cli_search_parser_accepts_safe_glob_options():
+    from seafile_vault_cli.cli import build_parser
+
+    args = build_parser().parse_args(["search", "/docs", "--name", "*.md", "--type", "file", "--max-results", "5", "--case-sensitive"])
+    assert args.command == "search"
+    assert args.path == "/docs"
+    assert args.name == "*.md"
+    assert args.type == "file"
+    assert args.max_results == 5
+    assert args.case_sensitive is True
+
+
 def test_cli_download_stat_and_mkdir_parsers():
     from seafile_vault_cli.cli import build_parser
 
@@ -244,6 +256,141 @@ def test_cli_compact_list_preserves_zero_mtime_and_rejects_malformed_shape(monke
     payload = json.loads(capsys.readouterr().err)
     assert payload["error"]["code"] == "seafilevault"
     assert "not a list" in payload["error"]["message"]
+
+
+def test_cli_search_matches_case_type_and_normalizes_full_paths(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def validate_vault_path(self, path):
+            assert path == "/docs"
+            return path
+
+        def list_directory(self, path, *, recursive, type_filter):
+            assert (path, recursive, type_filter) == ("/docs", True, "f")
+            return {
+                "repo_id": "secret-repo",
+                "dirent_list": [
+                    {
+                        "name": "Note.md",
+                        "type": "file",
+                        "size": 7,
+                        "mtime": 0,
+                        "parent_dir": "/docs/sub/",
+                        "modifier_email": "x@example.com",
+                    },
+                    {"name": "note.MD", "type": "file", "size": 8, "path": "/docs/note.MD", "lock_owner": "x@example.com"},
+                    {"name": "notes", "type": "dir", "parent_dir": "/docs"},
+                    {"name": "image.png", "type": "file", "parent_dir": "/docs"},
+                ],
+            }
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    assert cli.main(["search", "/docs", "--name", "*.md", "--type", "file"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "ok": True,
+        "data": {
+            "path": "/docs",
+            "pattern": "*.md",
+            "count": 2,
+            "results": [
+                {"path": "/docs/sub/Note.md", "name": "Note.md", "type": "file", "size": 7, "mtime": 0},
+                {"path": "/docs/note.MD", "name": "note.MD", "type": "file", "size": 8},
+            ],
+        },
+    }
+
+    assert cli.main(["search", "/docs", "--name", "*.md", "--type", "file", "--case-sensitive"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [item["name"] for item in payload["data"]["results"]] == ["Note.md"]
+
+
+def test_cli_search_rejects_max_result_truncation_and_malformed_shapes(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+
+    class FakeClient:
+        def __init__(self, result):
+            self.result = result
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def validate_vault_path(self, path):
+            return path
+
+        def list_directory(self, path, *, recursive, type_filter):
+            return self.result
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient([{"name": "a.txt"}, {"name": "b.txt"}]))
+    assert cli.main(["search", "/", "--name", "*.txt", "--max-results", "1"]) == 6
+    payload = json.loads(capsys.readouterr().err)
+    assert "exceeding --max-results 1" in payload["error"]["message"]
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient({"dirent_list": {}}))
+    assert cli.main(["search", "/", "--name", "*.txt"]) == 6
+    payload = json.loads(capsys.readouterr().err)
+    assert "not a list" in payload["error"]["message"]
+
+
+def test_cli_search_rejects_adversarial_server_paths(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def validate_vault_path(self, path):
+            return "/docs"
+
+        def list_directory(self, path, *, recursive, type_filter):
+            return [
+                {"name": "good.txt", "type": "file", "parent_dir": "/docs/sub"},
+                {"name": "../escape.txt", "type": "file", "parent_dir": "/docs"},
+                {"name": "slash/name.txt", "type": "file", "parent_dir": "/docs"},
+                {"name": "back\\name.txt", "type": "file", "parent_dir": "/docs"},
+                {"name": "nul\x00name.txt", "type": "file", "parent_dir": "/docs"},
+                {"name": "control\nname.txt", "type": "file", "parent_dir": "/docs"},
+                {"name": "escape.txt", "type": "file", "parent_dir": "/docs/.."},
+                {"name": "double.txt", "type": "file", "parent_dir": "/docs//sub"},
+                {"name": "dot.txt", "type": "file", "parent_dir": "/docs/./sub"},
+                {"name": "trail.txt", "type": "file", "parent_dir": "/docs/sub/"},
+                {"name": "doubletrail.txt", "type": "file", "parent_dir": "/docs/sub//"},
+                {"name": "pathtrail.txt", "type": "file", "path": "/docs/sub/pathtrail.txt/"},
+                {"name": "fulltrail.txt", "type": "file", "full_path": "/docs/sub/fulltrail.txt/"},
+                {"name": "outside.txt", "type": "file", "path": "/outside/outside.txt"},
+                {"name": "mismatch.txt", "type": "file", "path": "/docs/other.txt"},
+                {"name": "relative.txt", "type": "file", "parent_dir": "docs"},
+            ]
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    assert cli.main(["search", "/docs", "--name", "*.txt", "--type", "file"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["data"]["results"] == [
+        {"name": "good.txt", "path": "/docs/sub/good.txt", "type": "file"},
+        {"name": "trail.txt", "path": "/docs/sub/trail.txt", "type": "file"},
+    ]
+
+
+def test_cli_search_rejects_invalid_max_bounds(capsys):
+    from seafile_vault_cli.cli import build_parser
+
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["search", "/", "--name", "*", "--max-results", "1001"])
+    assert excinfo.value.code == 2
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "usage"
 
 
 def test_cli_download_stat_and_mkdir_json_calls(monkeypatch, capsys):

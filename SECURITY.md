@@ -6,4 +6,6 @@ Do not include real Seafile hosts, origin IPs, repo IDs, repo tokens, token-bear
 
 Local-path uploads reject final symlinks, require a regular file, check configured size limits before requesting an upload link, and upload from the same descriptor that was validated. Direct-origin upload keeps token-bearing upload URLs out of argv and fails closed when descriptor-safe curl input is unavailable.
 
+The `seafile-library` launcher reads exactly one named UTF-8 env file from the configured library profile directory, rejects symlinks and insecure permissions, does not evaluate shell syntax, and never reports profile paths or env values in errors.
+
 Supported versions follow the latest released version until a formal release policy is published.
