@@ -1,7 +1,7 @@
 ---
 name: seafile-vault-cli
 description: Use when operating one token-scoped Seafile library through Seafile Vault CLI or its optional MCP server.
-version: 0.2.0
+version: 0.3.0
 author: Sakina
 license: AGPL-3.0
 metadata:
@@ -25,7 +25,7 @@ The optional MCP server exposes the same narrow operations, but the CLI is the p
 ## When to Use
 
 - Inspect metadata for one configured library.
-- List explicit directories and read or download explicit files within size limits.
+- List or search explicit directories and read or download explicit files within size limits.
 - Generate same-origin download links returned by Seafile only when a caller explicitly needs the bearer-like temporary link.
 - Create, rename, move, delete, write, or upload explicit paths after enabling `read_write` for that process.
 - Upload large files with native Seafile multi-request chunked/resumable upload through the normal upload link.
@@ -34,6 +34,7 @@ The optional MCP server exposes the same narrow operations, but the CLI is the p
 ## When Not to Use
 
 - Do not use for multiple libraries, account-wide automation, or admin operations.
+- Do not add course-audit or cross-source orchestration commands.
 - Do not use for glob delete, recursive bulk mutation, or unreviewed destructive cleanup.
 - Do not pass repo tokens on argv or embed secrets in prompts, logs, docs, tests, or shell history.
 - Do not use direct-origin upload unless the origin IP and upload path are approved for that environment.
@@ -95,6 +96,7 @@ Keep `SEAFILE_PERMISSION_MODE=read_only` for inspection:
 seafile-vault repo-info
 seafile-vault list /
 seafile-vault list / --recursive --type file --compact
+seafile-vault search / --name '*.md' --type file --max-results 50
 seafile-vault stat /path/file.md
 seafile-vault download /path/file.md ./file.md
 seafile-vault download-link /path/file.md
@@ -111,6 +113,20 @@ Paths must be absolute normalized POSIX paths. Unicode is allowed. Relative path
 ```json
 {"count":1,"entries":[{"mtime":1720000000,"name":"file.md","size":123,"type":"file"}],"path":"/path"}
 ```
+
+`search [REMOTE_DIR] --name GLOB [--type file|dir] [--max-results N] [--case-sensitive]` is read-only. It validates the directory path, uses the same recursive listing as `list`, applies safe shell-style glob matching to names only, and returns normalized full `path` values plus available `name`, `type`, `size`, and `mtime`. It defaults to 100 results, caps requests at 1000, and fails instead of truncating when a glob matches too many entries.
+
+## Library Profile Launcher
+
+Use `seafile-library` when operators provide named profile env files:
+
+```bash
+seafile-library --list
+seafile-library docs --help
+seafile-library docs search / --name '*.md'
+```
+
+Profiles are read from `~/.config/seafile-vault/libraries` or `SEAFILE_LIBRARY_CONFIG_DIR`. A profile name maps only to `<profile>.env`, and profile files must contain strict UTF-8 `KEY=VALUE` lines for `SEAFILE_SERVER_URL`, `SEAFILE_REPO_TOKEN`, and documented optional Seafile variables. The launcher rejects path traversal, control characters, symlinks, unsupported keys, duplicates, malformed lines, NUL bytes, insecure directory permissions, and env files readable by group or other users. Errors never include profile paths or env values.
 
 ## Mutation Workflow
 
@@ -197,8 +213,11 @@ uv run python -m pytest -p no:cacheprovider
 uv build
 uv run seafile-vault --help
 uv run seafile-vault list --help
+uv run seafile-vault search --help
 uv run seafile-vault download --help
 uv run seafile-vault upload --help
+uv run seafile-library --help
+uv run seafile-library --version
 ```
 
-Inspect built artifacts before publishing: the wheel should include `seafile_vault_cli/SKILL.md` and a complete license file, and the sdist should include root `SKILL.md` and `LICENSE`.
+Inspect built artifacts before publishing: the wheel should include `seafile_vault_cli/SKILL.md`, a complete license file, and entry points for `seafile-vault`, `seafile-library`, and `seafile-vault-mcp`; the sdist should include root `SKILL.md` and `LICENSE`.

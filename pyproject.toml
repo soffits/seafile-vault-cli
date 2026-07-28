@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "seafile-vault-cli"
-version = "0.2.0"
+version = "0.3.0"
 description = "Secure, non-interactive CLI for one token-scoped Seafile library"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -38,6 +38,7 @@ mcp = ["mcp>=1.28.1,<2"]
 
 [project.scripts]
 seafile-vault = "seafile_vault_cli.cli:main"
+seafile-library = "seafile_vault_cli.library_launcher:main"
 seafile-vault-mcp = "seafile_vault_cli.mcp_server:main"
 
 [tool.hatch.build.targets.sdist]

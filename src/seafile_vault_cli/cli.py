@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import sys
+from pathlib import PurePosixPath
 from typing import Any
 
 from . import __version__
@@ -24,6 +26,12 @@ EXIT_CONFIG = 3
 EXIT_PERMISSION = 4
 EXIT_SECURITY = 5
 EXIT_SEAFILE = 6
+SEARCH_DEFAULT_MAX_RESULTS = 100
+SEARCH_HARD_MAX_RESULTS = 1000
+
+
+def _contains_ascii_control(value: str) -> bool:
+    return any(ord(char) < 32 or ord(char) == 127 for char in value)
 
 
 class JsonArgumentParser(argparse.ArgumentParser):
@@ -45,6 +53,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument("--recursive", action="store_true", help="List recursively")
     p_list.add_argument("--type", choices=("file", "dir"), help="Filter entries by type")
     p_list.add_argument("--compact", action="store_true", help="Return agent-safe compact directory entries")
+    p_search = sub.add_parser("search", help="Search one vault directory recursively by safe glob")
+    p_search.add_argument("path", nargs="?", default="/", metavar="REMOTE_DIR")
+    p_search.add_argument("--name", required=True, metavar="GLOB", help="Shell-style glob matched against entry names")
+    p_search.add_argument("--type", choices=("file", "dir"), help="Filter entries by type")
+    p_search.add_argument("--max-results", type=_max_results_arg, default=SEARCH_DEFAULT_MAX_RESULTS, metavar="N")
+    p_search.add_argument("--case-sensitive", action="store_true", help="Use case-sensitive name matching")
     sub.add_parser("repo-info", help="Show repo information")
     p_dl = sub.add_parser("download-link", help="Get a file download link")
     p_dl.add_argument("path")
@@ -91,6 +105,16 @@ def _chunk_size_arg(value: str) -> int:
         return _parse_upload_chunk_size_text("chunk size", value)
     except ConfigError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _max_results_arg(value: str) -> int:
+    try:
+        parsed = int(value, 10)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("max results must be an integer") from exc
+    if parsed < 1 or parsed > SEARCH_HARD_MAX_RESULTS:
+        raise argparse.ArgumentTypeError(f"max results must be between 1 and {SEARCH_HARD_MAX_RESULTS}")
+    return parsed
 
 
 def _success(data: Any) -> dict[str, Any]:
@@ -140,6 +164,106 @@ def _compact_list(path: str, data: Any) -> dict[str, Any]:
     return {"path": path, "count": len(compact_entries), "entries": compact_entries}
 
 
+def _entry_type(entry: dict[str, Any]) -> str | None:
+    raw_type = entry.get("type") or entry.get("obj_type")
+    if raw_type in {"d", "directory"}:
+        return "dir"
+    if raw_type == "f":
+        return "file"
+    return raw_type if raw_type in {"file", "dir"} else None
+
+
+def _entry_full_path(base_path: str, name: str, entry: dict[str, Any]) -> str | None:
+    if _contains_ascii_control(name) or "/" in name or "\\" in name or name in {".", ".."}:
+        return None
+    raw_path = entry.get("path") or entry.get("full_path")
+    raw_is_full_path = raw_path is not None
+    if raw_path is None:
+        raw_path = entry.get("parent_dir")
+    if raw_path is not None and not isinstance(raw_path, str):
+        return None
+    if isinstance(raw_path, str):
+        if not raw_path.startswith("/") or _contains_ascii_control(raw_path):
+            return None
+        if not raw_is_full_path and raw_path != "/" and raw_path.endswith("/"):
+            if raw_path.endswith("//"):
+                return None
+            raw_path = raw_path[:-1]
+        parts = raw_path.split("/")
+        if any(part == "" for part in parts[1:]) or any(part in {".", ".."} for part in parts[1:]):
+            return None
+        if raw_path != "/" and raw_path.endswith("/"):
+            return None
+        normalized_raw = str(PurePosixPath(raw_path))
+        if normalized_raw != raw_path:
+            return None
+        if raw_is_full_path:
+            if not (raw_path.endswith(f"/{name}") or raw_path == f"/{name}"):
+                return None
+            candidate = raw_path
+        elif raw_path.endswith(f"/{name}") or raw_path == f"/{name}":
+            candidate = raw_path
+        else:
+            candidate = f"/{name}" if raw_path == "/" else f"{raw_path}/{name}"
+    else:
+        candidate = f"{base_path.rstrip('/')}/{name}" if base_path != "/" else f"/{name}"
+    normalized = str(PurePosixPath(candidate))
+    base_prefix = "/" if base_path == "/" else f"{base_path}/"
+    if normalized != candidate or not normalized.startswith("/") or (base_path != "/" and not normalized.startswith(base_prefix)):
+        return None
+    return normalized
+
+
+def _search_results(
+    base_path: str,
+    data: Any,
+    *,
+    pattern: str,
+    type_filter: str | None,
+    max_results: int,
+    case_sensitive: bool,
+) -> dict[str, Any]:
+    entries = data.get("dirent_list") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        raise SeafileVaultError("directory listing response was not a list")
+    needle = pattern if case_sensitive else pattern.casefold()
+    results: list[dict[str, Any]] = []
+    matched = 0
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name") or entry.get("obj_name")
+        if not isinstance(name, str) or not name:
+            continue
+        entry_type = _entry_type(entry)
+        if type_filter is not None and entry_type != type_filter:
+            continue
+        haystack = name if case_sensitive else name.casefold()
+        if not fnmatch.fnmatchcase(haystack, needle):
+            continue
+        full_path = _entry_full_path(base_path, name, entry)
+        if full_path is None:
+            continue
+        matched += 1
+        if len(results) >= max_results:
+            continue
+        item: dict[str, Any] = {"path": full_path, "name": name}
+        if entry_type is not None:
+            item["type"] = entry_type
+        size = entry.get("size")
+        if isinstance(size, int) and not isinstance(size, bool):
+            item["size"] = size
+        mtime = entry["mtime"] if "mtime" in entry else entry.get("last_modified")
+        if isinstance(mtime, (int, str)) and not isinstance(mtime, bool):
+            item["mtime"] = mtime
+        results.append(item)
+    if matched > max_results:
+        raise SeafileVaultError(
+            f"search matched {matched} entries, exceeding --max-results {max_results}; narrow the glob or raise the limit"
+        )
+    return {"path": base_path, "pattern": pattern, "count": len(results), "results": results}
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -149,6 +273,18 @@ def main(argv: list[str] | None = None) -> int:
                 result = client.list_directory(args.path, recursive=args.recursive, type_filter=type_filter)
                 if args.compact:
                     result = _compact_list(args.path, result)
+            elif args.command == "search":
+                base_path = client.validate_vault_path(args.path)
+                type_filter = {"file": "f", "dir": "d"}.get(args.type)
+                result = client.list_directory(base_path, recursive=True, type_filter=type_filter)
+                result = _search_results(
+                    base_path,
+                    result,
+                    pattern=args.name,
+                    type_filter=args.type,
+                    max_results=args.max_results,
+                    case_sensitive=args.case_sensitive,
+                )
             elif args.command == "repo-info":
                 result = client.get_repo_info()
             elif args.command == "download-link":

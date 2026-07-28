@@ -12,6 +12,8 @@ The CLI is the primary product. The optional MCP server exposes the same narrow 
 - Validates remote paths as absolute normalized POSIX paths such as `/inbox/file.md`.
 - Rejects `.`, `..`, duplicate slashes, ASCII control characters, relative paths, root rename, root move, and root delete.
 - Does not implement glob or bulk delete.
+- `search` is read-only, uses safe shell-style glob matching against names only, caps requested results at 1000, and fails instead of silently truncating overbroad matches.
+- `seafile-library` selects one named library profile from `~/.config/seafile-vault/libraries` or `SEAFILE_LIBRARY_CONFIG_DIR` without shell evaluation.
 - Never overwrites uploads unless `--overwrite` or `overwrite=True` is explicit.
 - Constrains returned download and upload links to the configured `SEAFILE_SERVER_URL` origin. Temporary download and upload links are bearer-like secrets.
 - `download` obtains temporary download links internally and never returns or logs them.
@@ -74,6 +76,7 @@ Use `read_only` for inspection and `read_write` only for sessions that must crea
 seafile-vault repo-info
 seafile-vault list /
 seafile-vault list / --recursive --type file --compact
+seafile-vault search / --name '*.md' --type file --max-results 50
 seafile-vault stat /inbox/note.md
 seafile-vault download /inbox/note.md ./note.md
 seafile-vault download /inbox/note.md ./note.md --overwrite
@@ -116,6 +119,7 @@ Read syntax:
 seafile-vault stat REMOTE_PATH
 seafile-vault download REMOTE_PATH LOCAL_FILE [--overwrite]
 seafile-vault list [REMOTE_DIR] [--recursive] [--type file|dir] [--compact]
+seafile-vault search [REMOTE_DIR] --name GLOB [--type file|dir] [--max-results N] [--case-sensitive]
 ```
 
 `stat` is file metadata only and rejects root. A missing file returns structured `remote_not_found` JSON instead of `null` success.
@@ -133,6 +137,23 @@ Download result JSON contains only non-sensitive metadata:
 ```json
 {"count":1,"entries":[{"mtime":1720000000,"name":"note.md","size":123,"type":"file"}],"path":"/inbox"}
 ```
+
+`search` validates `REMOTE_DIR`, performs the existing recursive directory listing for that one scoped library, and applies Python `fnmatch` shell-style glob matching to entry names only. It does not execute regular expressions. Results include only normalized full remote `path` plus available `name`, `type`, `size`, and `mtime`; repo IDs, modifier emails, locks, tokens, and other internals are omitted. The default limit is 100 results and the hard maximum is 1000. If more entries match than `--max-results`, the command returns a structured error instead of silently truncating.
+
+## Library Profiles
+
+`seafile-library` is an installed launcher for selecting named library env files:
+
+```bash
+seafile-library --list
+seafile-library docs --help
+seafile-library docs search / --name '*.md'
+seafile-library docs list / --compact
+```
+
+Profiles live in `~/.config/seafile-vault/libraries` by default, overridable with `SEAFILE_LIBRARY_CONFIG_DIR`. A profile named `docs` must be exactly `docs.env` in that directory and contain strict UTF-8 `KEY=VALUE` lines without shell evaluation. Required keys are `SEAFILE_SERVER_URL` and `SEAFILE_REPO_TOKEN`. Optional documented Seafile keys are `SEAFILE_PERMISSION_MODE`, `SEAFILE_MAX_READ_SIZE`, `SEAFILE_MAX_WRITE_SIZE`, `SEAFILE_REQUEST_TIMEOUT`, `SEAFILE_UPLOAD_TIMEOUT`, `SEAFILE_UPLOAD_CHUNK_SIZE`, and `SEAFILE_UPLOAD_DIRECT_IP`.
+
+The launcher rejects path traversal, control characters, symlinks, unsupported or duplicate keys, malformed lines, NUL bytes, insecure directory ownership/permissions, and env files readable/writable/executable by group or other users. `--list` returns compact JSON profile names only. Missing profiles return structured JSON with safe name suggestions only, never paths or env values.
 
 Plain `mkdir /path` first lists the exact parent and fails if any file or directory already has the requested exact name. `mkdir --parents /a/b/c` returns concise metadata such as:
 
@@ -205,8 +226,11 @@ uv run python -m pytest -p no:cacheprovider
 uv build
 uv run seafile-vault --help
 uv run seafile-vault list --help
+uv run seafile-vault search --help
 uv run seafile-vault download --help
 uv run seafile-vault upload --help
+uv run seafile-library --help
+uv run seafile-library --version
 ```
 
 For release verification, inspect the wheel and sdist contents after `uv build`; do not claim live large-file success until a separate operator performs an upload through the target public hostname.
