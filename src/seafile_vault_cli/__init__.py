@@ -5,6 +5,7 @@ from .client import (
     ConfigError,
     LinkSecurityError,
     LocalFileError,
+    LockNotActiveError,
     PathSecurityError,
     PermissionMode,
     PermissionModeError,
@@ -18,6 +19,7 @@ __all__ = [
     "Config",
     "ConfigError",
     "LinkSecurityError",
+    "LockNotActiveError",
     "LocalFileError",
     "PathSecurityError",
     "PermissionMode",
@@ -28,4 +30,4 @@ __all__ = [
     "SizeLimitError",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

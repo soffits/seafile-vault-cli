@@ -15,6 +15,7 @@ from seafile_vault_cli.client import (
     ConfigError,
     LinkSecurityError,
     LocalFileError,
+    LockNotActiveError,
     PathSecurityError,
     PermissionMode,
     PermissionModeError,
@@ -57,10 +58,105 @@ def test_read_only_mode_allows_reads_and_blocks_writes(httpx_mock_transport):
     with pytest.raises(PermissionModeError):
         client.move_path("/old", "/archive")
     with pytest.raises(PermissionModeError):
+        client.copy_file("/old", "/archive")
+    with pytest.raises(PermissionModeError):
+        client.lock_file("/old", 3600)
+    with pytest.raises(PermissionModeError):
+        client.unlock_file("/old")
+    with pytest.raises(PermissionModeError):
         client.delete_path("/old")
     with pytest.raises(PermissionModeError):
         client.write_text_file("/file.txt", "hello")
     assert len(requests) == 1
+
+
+def test_copy_file_posts_same_library_operation_and_strips_repo_ids(httpx_mock_transport):
+    client, requests = httpx_mock_transport(
+        json_body={
+            "repo_id": TEST_REPO_ID,
+            "obj_name": "note (1).txt",
+            "type": "file",
+            "nested": {"repo_id": TEST_REPO_ID, "kept": True},
+        },
+        permission_mode=PermissionMode.READ_WRITE,
+    )
+
+    result = client.copy_file("/docs/note.txt", "/archive")
+
+    request = requests[0]
+    assert request.method == "POST"
+    assert request.url.path == "/api/v2.1/via-repo-token/file/"
+    assert request.url.params["path"] == "/docs/note.txt"
+    assert json.loads(request.content) == {"operation": "copy", "dst_dir": "/archive"}
+    assert result == {
+        "source_path": "/docs/note.txt",
+        "destination_dir": "/archive",
+        "destination_name": "note (1).txt",
+        "destination_path": "/archive/note (1).txt",
+        "metadata": {"obj_name": "note (1).txt", "type": "file", "nested": {"kept": True}},
+    }
+    assert "repo_id" not in json.dumps(result)
+
+
+def test_copy_directory_uses_single_item_batch_copy_and_rejects_recursive_destinations(httpx_mock_transport):
+    client, requests = httpx_mock_transport(
+        json_body={"success": True, "repo_id": TEST_REPO_ID},
+        permission_mode=PermissionMode.READ_WRITE,
+    )
+
+    result = client.copy_path("/docs/project", "/archive", is_directory=True)
+
+    request = requests[0]
+    assert request.method == "POST"
+    assert request.url.path == "/api/v2.1/via-repo-token/sync-batch-copy-item/"
+    assert json.loads(request.content) == {
+        "src_parent_dir": "/docs",
+        "src_dirents": ["project"],
+        "dst_parent_dir": "/archive",
+    }
+    assert result == {
+        "source_path": "/docs/project",
+        "destination_directory": "/archive",
+        "destination_path": "/archive/project",
+        "type": "dir",
+        "server_result": {"success": True},
+    }
+
+    with pytest.raises(PathSecurityError):
+        client.copy_directory("/docs/project", "/docs/project/child")
+    with pytest.raises(PathSecurityError):
+        client.copy_directory("/docs/project", "/docs")
+
+
+def test_lock_and_unlock_use_put_payloads_and_expiry_bounds(httpx_mock_transport):
+    client, requests = httpx_mock_transport(json_body={"success": True}, permission_mode=PermissionMode.READ_WRITE)
+
+    assert client.lock_file("/docs/note.txt", 120) == {"success": True}
+    assert client.unlock_file("/docs/note.txt") == {"success": True}
+
+    assert [request.method for request in requests] == ["PUT", "PUT"]
+    assert [request.url.path for request in requests] == ["/api/v2.1/via-repo-token/file/", "/api/v2.1/via-repo-token/file/"]
+    assert [request.url.params["path"] for request in requests] == ["/docs/note.txt", "/docs/note.txt"]
+    assert json.loads(requests[0].content) == {"operation": "lock", "expire": 120}
+    assert json.loads(requests[1].content) == {"operation": "unlock"}
+    with pytest.raises(ConfigError):
+        client.lock_file("/docs/note.txt", 0)
+    with pytest.raises(ConfigError):
+        client.lock_file("/docs/note.txt", -1)
+
+
+def test_unlock_reports_not_locked_without_silent_success():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(409, json={"error": "file is not locked"})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        permission_mode=PermissionMode.READ_WRITE,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    with pytest.raises(LockNotActiveError):
+        client.unlock_file("/docs/note.txt")
 
 
 def test_programmatic_upload_chunk_size_remains_integer_only():

@@ -14,9 +14,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
+
+from .lock_policy import validate_lock_expiry_seconds
 
 DEFAULT_MAX_READ_SIZE = 1024 * 1024
 DEFAULT_MAX_WRITE_SIZE = 10 * 1024 * 1024
@@ -28,7 +30,33 @@ MAX_MULTIPART_REQUEST_BODY_SIZE = 100_000_000
 CHUNK_READ_SIZE = 1024 * 1024
 MAX_CHUNK_ATTEMPTS = 3
 FINAL_VERIFY_ATTEMPTS = 3
+DEFAULT_SHARE_EXPIRE_DAYS = 7
+MAX_SHARE_EXPIRE_DAYS = 30
+DEFAULT_THUMBNAIL_SIZE = 256
+MAX_THUMBNAIL_SIZE = 1024
+MAX_THUMBNAIL_BYTES = 1024 * 1024
+METADATA_DEFAULT_LIMIT = 1000
+METADATA_MAX_LIMIT = 1000
+METADATA_RECORD_UPDATE_LIMIT = 1000
+METADATA_JSON_MAX_BYTES = 256 * 1024
+METADATA_MAX_BODY_ITEMS = 1000
+METADATA_ROUTES = {
+    "records": "metadata/records/",
+    "views": "metadata/views/",
+    "views_detail": "metadata/views/{view_id}/",
+    "views_duplicate": "metadata/duplicate-view/",
+    "views_move": "metadata/move-views/",
+    "tags": "metadata/tags/",
+    "tags_status": "metadata/tags-status/",
+    "tags_links": "metadata/tags-links/",
+    "file_tags": "metadata/file-tags/",
+    "tag_files": "metadata/tag-files/{tag_id}/",
+    "tags_files": "metadata/tags-files/",
+    "merge_tags": "metadata/merge-tags/",
+}
 _REPO_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+_COMMIT_ID_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_METADATA_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _CHUNK_SIZE_TEXT_RE = re.compile(r"^([0-9]+)(?:\s*([A-Za-z]+))?$")
 _CHUNK_SIZE_UNITS = {
     "b": 1,
@@ -47,6 +75,10 @@ class SeafileVaultError(RuntimeError):
 
 class ConfigError(SeafileVaultError):
     """Configuration is missing or invalid."""
+
+
+class CapabilityError(SeafileVaultError):
+    """The active token set cannot perform a requested optional capability."""
 
 
 class PermissionModeError(SeafileVaultError, PermissionError):
@@ -71,6 +103,10 @@ class LocalFileError(SeafileVaultError, ValueError):
 
 class RemoteNotFoundError(SeafileVaultError, FileNotFoundError):
     """Remote path was not found."""
+
+
+class LockNotActiveError(SeafileVaultError):
+    """Server reported that the requested file is not currently locked."""
 
 
 class PermissionMode(StrEnum):
@@ -100,6 +136,33 @@ def _sanitize_upload_value(value: Any, *secrets: str | None) -> Any:
     if isinstance(value, str):
         return redact_secret(value, *secrets)
     if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return None
+
+
+def _strip_sensitive_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_sensitive_metadata(item)
+            for key, item in value.items()
+            if isinstance(key, str)
+            and key.lower()
+            not in {
+                "account_token",
+                "authorization",
+                "library_key",
+                "lock_owner",
+                "modifier_email",
+                "owner_email",
+                "password",
+                "repo_id",
+                "repoid",
+                "token",
+            }
+        }
+    if isinstance(value, list):
+        return [_strip_sensitive_metadata(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return None
 
@@ -261,6 +324,52 @@ def _validate_positive_int(name: str, value: int) -> int:
     return value
 
 
+def validate_commit_id(value: str) -> str:
+    if not isinstance(value, str) or _COMMIT_ID_RE.fullmatch(value) is None:
+        raise ConfigError("commit ID must be a 40-character hexadecimal Seafile commit ID")
+    return value.lower()
+
+
+def validate_share_expire_days(value: int) -> int:
+    days = _validate_positive_int("expire_days", value)
+    if days > MAX_SHARE_EXPIRE_DAYS:
+        raise ConfigError(f"expire_days must be <= {MAX_SHARE_EXPIRE_DAYS}")
+    return days
+
+
+def validate_thumbnail_size(value: int) -> int:
+    size = _validate_positive_int("thumbnail_size", value)
+    if size > MAX_THUMBNAIL_SIZE:
+        raise ConfigError(f"thumbnail_size must be <= {MAX_THUMBNAIL_SIZE}")
+    return size
+
+
+def validate_metadata_id(name: str, value: str) -> str:
+    if not isinstance(value, str) or _METADATA_ID_RE.fullmatch(value) is None:
+        raise ConfigError(f"{name} must be 1-128 characters of ASCII letters, digits, '_' or '-'")
+    return value
+
+
+def validate_metadata_start(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ConfigError("start must be a non-negative integer")
+    return value
+
+
+def validate_metadata_limit(value: int) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1 or value > METADATA_MAX_LIMIT:
+        raise ConfigError(f"limit must be between 1 and {METADATA_MAX_LIMIT}")
+    return value
+
+
+def validate_metadata_body_items(name: str, value: Any, *, limit: int = METADATA_MAX_BODY_ITEMS) -> list[Any]:
+    if not isinstance(value, list) or not value:
+        raise ConfigError(f"{name} must be a non-empty array")
+    if len(value) > limit:
+        raise ConfigError(f"{name} must contain at most {limit} items")
+    return value
+
+
 def _validate_positive_float(name: str, value: float) -> float:
     if isinstance(value, bool):
         raise ConfigError(f"{name} must be positive")
@@ -334,6 +443,7 @@ def _validated_server_url(raw: str) -> str:
 class Config:
     server_url: str
     repo_token: str
+    account_token: str | None = None
     permission_mode: PermissionMode = PermissionMode.READ_ONLY
     max_read_size: int = DEFAULT_MAX_READ_SIZE
     max_write_size: int = DEFAULT_MAX_WRITE_SIZE
@@ -346,13 +456,17 @@ class Config:
     def from_env(cls) -> Config:
         server_url = os.environ.get("SEAFILE_SERVER_URL") or ""
         repo_token = os.environ.get("SEAFILE_REPO_TOKEN") or ""
+        account_token = os.environ.get("SEAFILE_ACCOUNT_TOKEN") if "SEAFILE_ACCOUNT_TOKEN" in os.environ else None
         if not server_url.strip():
             raise ConfigError("SEAFILE_SERVER_URL is required")
         if not repo_token:
             raise ConfigError("SEAFILE_REPO_TOKEN is required")
+        if account_token is not None and not account_token.strip():
+            raise ConfigError("SEAFILE_ACCOUNT_TOKEN must be non-empty when set")
         return cls(
             server_url=_validated_server_url(server_url),
             repo_token=repo_token,
+            account_token=account_token,
             permission_mode=_parse_permission_mode(os.environ.get("SEAFILE_PERMISSION_MODE")),
             max_read_size=_parse_int_env("SEAFILE_MAX_READ_SIZE", DEFAULT_MAX_READ_SIZE),
             max_write_size=_parse_int_env("SEAFILE_MAX_WRITE_SIZE", DEFAULT_MAX_WRITE_SIZE),
@@ -371,6 +485,7 @@ class SeafileVaultClient:
         server_url: str,
         repo_token: str,
         *,
+        account_token: str | None = None,
         permission_mode: PermissionMode | str = PermissionMode.READ_ONLY,
         max_read_size: int = DEFAULT_MAX_READ_SIZE,
         max_write_size: int = DEFAULT_MAX_WRITE_SIZE,
@@ -383,7 +498,10 @@ class SeafileVaultClient:
         self.server_url = _validated_server_url(server_url)
         if not isinstance(repo_token, str) or not repo_token.strip():
             raise ConfigError("repo_token must be a non-empty string")
+        if account_token is not None and (not isinstance(account_token, str) or not account_token.strip()):
+            raise ConfigError("account_token must be a non-empty string when set")
         self.repo_token = repo_token
+        self.account_token = account_token
         self.permission_mode = _parse_permission_mode(str(permission_mode))
         self.max_read_size = _validate_positive_int("max_read_size", max_read_size)
         self.max_write_size = _validate_positive_int("max_write_size", max_write_size)
@@ -400,6 +518,7 @@ class SeafileVaultClient:
         return cls(
             cfg.server_url,
             cfg.repo_token,
+            account_token=cfg.account_token,
             permission_mode=cfg.permission_mode,
             max_read_size=cfg.max_read_size,
             max_write_size=cfg.max_write_size,
@@ -455,6 +574,15 @@ class SeafileVaultClient:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.repo_token}", "Accept": "application/json"}
 
+    @property
+    def _account_headers(self) -> dict[str, str]:
+        if self.account_token is None:
+            raise CapabilityError("SEAFILE_ACCOUNT_TOKEN is required for this account-token capability")
+        return {"Authorization": f"Token {self.account_token}", "Accept": "application/json"}
+
+    def _redact(self, text: str, *secrets_to_redact: str | None) -> str:
+        return redact_secret(text, self.repo_token, self.account_token, *secrets_to_redact)
+
     def _request(self, method: str, suffix: str, **kwargs: Any) -> httpx.Response:
         headers = dict(self._headers)
         headers.update(kwargs.pop("headers", {}) or {})
@@ -467,16 +595,71 @@ class SeafileVaultClient:
             body = exc.response.text[:1000] if exc.response is not None else ""
             status = exc.response.status_code if exc.response else "error"
             msg = f"Seafile HTTP {status}: {body}"
-            raise SeafileVaultError(redact_secret(msg, self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(msg, url)) from None
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(str(exc), url)) from None
+
+    def _metadata_capability_message(self, response: httpx.Response) -> str | None:
+        body = response.text[:1000]
+        lowered = body.lower()
+        if response.status_code in {404, 409} and (
+            "metadata module is disabled" in lowered
+            or "metadata module is not enabled" in lowered
+            or "tags is disabled" in lowered
+            or "disabled the tags manage" in lowered
+            or "tags not be used" in lowered
+            or "tags table not found" in lowered
+        ):
+            if "tag" in lowered:
+                return "metadata tags are disabled for this library; enable tags before using tag operations"
+            return "metadata is disabled for this library; enable Seafile metadata before using metadata operations"
+        if response.status_code == 405:
+            return "this Seafile deployment does not expose the requested repo-token metadata capability"
+        return None
+
+    def _metadata_request(self, method: str, suffix: str, **kwargs: Any) -> httpx.Response:
+        headers = dict(self._headers)
+        headers.update(kwargs.pop("headers", {}) or {})
+        url = self._url(suffix)
+        try:
+            response = self.http.request(method, url, headers=headers, **kwargs)
+            capability_message = self._metadata_capability_message(response)
+            if capability_message is not None:
+                raise CapabilityError(capability_message)
+            response.raise_for_status()
+            return response
+        except CapabilityError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:1000] if exc.response is not None else ""
+            status = exc.response.status_code if exc.response else "error"
+            msg = f"Seafile metadata HTTP {status}: {body}"
+            raise SeafileVaultError(self._redact(msg, url)) from None
+        except httpx.HTTPError as exc:
+            raise SeafileVaultError(self._redact(str(exc), url)) from None
+
+    def _account_request(self, method: str, suffix: str, **kwargs: Any) -> httpx.Response:
+        extra_redactions = tuple(kwargs.pop("_redact_secrets", ()) or ())
+        headers = dict(self._account_headers)
+        headers.update(kwargs.pop("headers", {}) or {})
+        url = self._api_url(suffix)
+        try:
+            response = self.http.request(method, url, headers=headers, **kwargs)
+            response.raise_for_status()
+            return response
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:1000] if exc.response is not None else ""
+            status = exc.response.status_code if exc.response else "error"
+            raise SeafileVaultError(self._redact(f"Seafile account HTTP {status}: {body}", url, *extra_redactions)) from None
+        except httpx.HTTPError as exc:
+            raise SeafileVaultError(self._redact(str(exc), url, *extra_redactions)) from None
 
     def _raise_stream_status(self, response: httpx.Response, context: str, *secrets_to_redact: str | None) -> None:
         try:
             response.raise_for_status()
         except httpx.HTTPStatusError:
             message = f"Seafile {context} HTTP {response.status_code}"
-            raise SeafileVaultError(redact_secret(message, self.repo_token, *secrets_to_redact)) from None
+            raise SeafileVaultError(self._redact(message, *secrets_to_redact)) from None
 
     def get_repo_info(self) -> dict[str, Any]:
         return self._request("GET", "repo-info/").json()
@@ -487,6 +670,313 @@ class SeafileVaultClient:
         if not isinstance(repo_id, str) or not _REPO_ID_RE.fullmatch(repo_id):
             raise SeafileVaultError("repo-info response did not include repo_id")
         return repo_id
+
+    def _validate_page(self, name: str, value: int) -> int:
+        return _validate_positive_int(name, value)
+
+    def library_history(self, *, page: int = 1, per_page: int = 100) -> Any:
+        repo_id = self._repo_id()
+        response = self._account_request(
+            "GET",
+            f"repos/{repo_id}/history/",
+            params={"page": self._validate_page("page", page), "per_page": self._validate_page("per_page", per_page)},
+        )
+        return _strip_sensitive_metadata(response.json())
+
+    def file_history(self, path: str, *, cursor: str | None = None) -> Any:
+        path = self._validate_non_root_path(path, "read history for")
+        repo_id = self._repo_id()
+        params = {"path": path}
+        if cursor is not None:
+            params["commit_id"] = validate_commit_id(cursor)
+        response = self._account_request("GET", f"repos/{repo_id}/file/history/", params=params)
+        return _strip_sensitive_metadata(response.json())
+
+    def restore_file(self, path: str, *, commit_id: str) -> dict[str, Any]:
+        return self._restore_path(path, commit_id=commit_id, is_directory=False)
+
+    def restore_directory(self, path: str, *, commit_id: str) -> dict[str, Any]:
+        return self._restore_path(path, commit_id=commit_id, is_directory=True)
+
+    def _restore_path(self, path: str, *, commit_id: str, is_directory: bool) -> dict[str, Any]:
+        self.require_read_write()
+        path = self._validate_non_root_path(path, "restore")
+        commit_id = validate_commit_id(commit_id)
+        endpoint = "dir/" if is_directory else "file/"
+        response = self._request("POST", endpoint, params={"path": path}, json={"operation": "revert", "commit_id": commit_id})
+        return {
+            "path": path,
+            "type": "dir" if is_directory else "file",
+            "commit_id": commit_id,
+            "server_result": _strip_sensitive_metadata(response.json()),
+        }
+
+    def _share_items(self, data: Any) -> list[dict[str, Any]]:
+        raw_items = data.get("share_links") if isinstance(data, dict) else data
+        if not isinstance(raw_items, list):
+            raise SeafileVaultError("share-links response was not a list")
+        return [item for item in raw_items if isinstance(item, dict)]
+
+    def _current_library_share_items(self) -> tuple[str, list[dict[str, Any]]]:
+        repo_id = self._repo_id()
+        data = self._account_request("GET", "share-links/").json()
+        return repo_id, [item for item in self._share_items(data) if item.get("repo_id") == repo_id]
+
+    def _public_share_output(self, item: dict[str, Any]) -> dict[str, Any]:
+        safe = _strip_sensitive_metadata(item)
+        if not isinstance(safe, dict):
+            raise SeafileVaultError("share-link item was not an object")
+        result = {key: value for key, value in safe.items() if isinstance(key, str) and key.lower() not in {"token"}}
+        link = result.get("link")
+        if link is not None:
+            if not isinstance(link, str):
+                raise LinkSecurityError("share link must be a string")
+            result["link"] = self._validate_same_origin_url(link, "share link")
+        return result
+
+    def list_share_links(self) -> dict[str, Any]:
+        _repo_id, items = self._current_library_share_items()
+        links = [self._public_share_output(item) for item in items]
+        return {"count": len(links), "links": links}
+
+    def create_share_link(
+        self,
+        path: str,
+        *,
+        expire_days: int = DEFAULT_SHARE_EXPIRE_DAYS,
+        permission: Literal["view-download", "view-only"] = "view-download",
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        self.require_read_write()
+        path = self._validate_non_root_path(path, "share")
+        expire_days = validate_share_expire_days(expire_days)
+        permission_json = {
+            "view-download": {"can_view": True, "can_download": True},
+            "view-only": {"can_view": True, "can_download": False},
+        }.get(permission)
+        if permission_json is None:
+            raise ConfigError("share permission must be view-download or view-only")
+        repo_id = self._repo_id()
+        payload: dict[str, Any] = {
+            "repo_id": repo_id,
+            "path": path,
+            "expire_days": expire_days,
+            "permissions": permission_json,
+        }
+        if password is not None:
+            if not password:
+                raise ConfigError("share password must be non-empty")
+            payload["password"] = password
+        response = self._account_request(
+            "POST",
+            "share-links/",
+            json=payload,
+            _redact_secrets=(password,) if password is not None else (),
+        )
+        data = response.json()
+        if not isinstance(data, dict):
+            raise SeafileVaultError("share-link create response was not an object")
+        return self._public_share_output(data)
+
+    def revoke_share_link(self, token: str) -> dict[str, Any]:
+        self.require_read_write()
+        if not isinstance(token, str) or not token:
+            raise ConfigError("share token must be non-empty")
+        _repo_id, items = self._current_library_share_items()
+        if not any(item.get("token") == token for item in items):
+            raise CapabilityError("share token does not belong to the current library")
+        response = self._account_request("DELETE", f"share-links/{quote(token, safe='')}/", _redact_secrets=(token,))
+        data: Any
+        try:
+            data = response.json()
+        except ValueError:
+            data = None
+        return {"revoked": True, "server_result": _strip_sensitive_metadata(data)}
+
+    def _metadata_json(
+        self,
+        method: str,
+        route: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+    ) -> Any:
+        kwargs: dict[str, Any] = {}
+        if params is not None:
+            kwargs["params"] = params
+        if json_body is not None:
+            kwargs["json"] = json_body
+        response = self._metadata_request(method, route, **kwargs)
+        return _strip_sensitive_metadata(response.json())
+
+    def metadata_views_list(self) -> Any:
+        return self._metadata_json("GET", METADATA_ROUTES["views"])
+
+    def metadata_view_get(self, view_id: str) -> Any:
+        view_id = validate_metadata_id("view_id", view_id)
+        return self._metadata_json("GET", METADATA_ROUTES["views_detail"].format(view_id=quote(view_id, safe="")))
+
+    def metadata_records_list(self, view_id: str, *, start: int = 0, limit: int = METADATA_DEFAULT_LIMIT) -> Any:
+        view_id = validate_metadata_id("view_id", view_id)
+        return self._metadata_json(
+            "GET",
+            METADATA_ROUTES["records"],
+            params={"view_id": view_id, "start": validate_metadata_start(start), "limit": validate_metadata_limit(limit)},
+        )
+
+    def metadata_records_update(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        validate_metadata_body_items("records_data", body.get("records_data"), limit=METADATA_RECORD_UPDATE_LIMIT)
+        return self._metadata_json("PUT", METADATA_ROUTES["records"], json_body=body)
+
+    def metadata_views_create(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        name = body.get("name")
+        if not isinstance(name, str) or not name:
+            raise ConfigError("name must be a non-empty string")
+        folder_id = body.get("folder_id")
+        if folder_id is not None:
+            validate_metadata_id("folder_id", folder_id)
+        view_type = body.get("type")
+        if view_type is not None and (not isinstance(view_type, str) or not view_type):
+            raise ConfigError("type must be a non-empty string when set")
+        data = body.get("data")
+        if data is not None and not isinstance(data, dict):
+            raise ConfigError("data must be an object when set")
+        return self._metadata_json("POST", METADATA_ROUTES["views"], json_body=body)
+
+    def metadata_views_update(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        validate_metadata_id("view_id", body.get("view_id"))
+        if not isinstance(body.get("view_data"), dict) or not body["view_data"]:
+            raise ConfigError("view_data must be a non-empty object")
+        return self._metadata_json("PUT", METADATA_ROUTES["views"], json_body=body)
+
+    def metadata_views_delete(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        validate_metadata_id("view_id", body.get("view_id"))
+        folder_id = body.get("folder_id")
+        if folder_id is not None:
+            validate_metadata_id("folder_id", folder_id)
+        return self._metadata_json("DELETE", METADATA_ROUTES["views"], json_body=body)
+
+    def metadata_views_duplicate(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        validate_metadata_id("view_id", body.get("view_id"))
+        folder_id = body.get("folder_id")
+        if folder_id is not None:
+            validate_metadata_id("folder_id", folder_id)
+        return self._metadata_json("POST", METADATA_ROUTES["views_duplicate"], json_body=body)
+
+    def metadata_views_move(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        for key in ("source_view_id", "source_folder_id", "target_view_id", "target_folder_id"):
+            value = body.get(key)
+            if value is not None:
+                validate_metadata_id(key, value)
+        if not body.get("source_view_id") and not body.get("source_folder_id"):
+            raise ConfigError("source_view_id or source_folder_id is required")
+        if not body.get("target_view_id") and not body.get("target_folder_id"):
+            raise ConfigError("target_view_id or target_folder_id is required")
+        if "is_above_folder" in body and not isinstance(body["is_above_folder"], bool):
+            raise ConfigError("is_above_folder must be a boolean when set")
+        return self._metadata_json("POST", METADATA_ROUTES["views_move"], json_body=body)
+
+    def metadata_tags_status(self) -> dict[str, Any]:
+        try:
+            data = self.metadata_tags_list(start=0, limit=1)
+        except CapabilityError as exc:
+            if "tags are disabled" in str(exc):
+                return {"enabled": False, "message": str(exc)}
+            raise
+        return {"enabled": True, "sample": data}
+
+    def metadata_tags_enable(self, *, lang: str) -> Any:
+        self.require_read_write()
+        if not isinstance(lang, str) or not lang:
+            raise ConfigError("lang must be a non-empty string")
+        return self._metadata_json("PUT", METADATA_ROUTES["tags_status"], json_body={"lang": lang})
+
+    def metadata_tags_disable(self) -> Any:
+        self.require_read_write()
+        return self._metadata_json("DELETE", METADATA_ROUTES["tags_status"], json_body={})
+
+    def metadata_tags_list(self, *, start: int = 0, limit: int = METADATA_DEFAULT_LIMIT) -> Any:
+        return self._metadata_json(
+            "GET",
+            METADATA_ROUTES["tags"],
+            params={"start": validate_metadata_start(start), "limit": validate_metadata_limit(limit)},
+        )
+
+    def metadata_tags_create(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        validate_metadata_body_items("tags_data", body.get("tags_data"))
+        return self._metadata_json("POST", METADATA_ROUTES["tags"], json_body=body)
+
+    def metadata_tags_update(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        validate_metadata_body_items("tags_data", body.get("tags_data"))
+        return self._metadata_json("PUT", METADATA_ROUTES["tags"], json_body=body)
+
+    def metadata_tags_delete(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        tag_ids = validate_metadata_body_items("tag_ids", body.get("tag_ids"))
+        for tag_id in tag_ids:
+            validate_metadata_id("tag_id", tag_id)
+        return self._metadata_json("DELETE", METADATA_ROUTES["tags"], json_body=body)
+
+    def metadata_tag_link_create(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        self._validate_tag_link_body(body, require_column=True)
+        return self._metadata_json("POST", METADATA_ROUTES["tags_links"], json_body=body)
+
+    def metadata_tag_link_update(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        self._validate_tag_link_body(body, require_column=False)
+        return self._metadata_json("PUT", METADATA_ROUTES["tags_links"], json_body=body)
+
+    def metadata_tag_link_delete(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        self._validate_tag_link_body(body, require_column=True)
+        return self._metadata_json("DELETE", METADATA_ROUTES["tags_links"], json_body=body)
+
+    def _validate_tag_link_body(self, body: dict[str, Any], *, require_column: bool) -> None:
+        link_column_key = body.get("link_column_key")
+        if require_column and (not isinstance(link_column_key, str) or not link_column_key):
+            raise ConfigError("link_column_key must be a non-empty string")
+        if link_column_key is not None and (not isinstance(link_column_key, str) or not link_column_key or len(link_column_key) > 128):
+            raise ConfigError("link_column_key must be a non-empty string up to 128 characters when set")
+        if not isinstance(body.get("row_id_map"), dict) or not body["row_id_map"]:
+            raise ConfigError("row_id_map must be a non-empty object")
+
+    def metadata_file_tags_assign(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        file_tags_data = validate_metadata_body_items("file_tags_data", body.get("file_tags_data"))
+        for item in file_tags_data:
+            if isinstance(item, dict) and item.get("record_id"):
+                validate_metadata_id("record_id", item["record_id"])
+        return self._metadata_json("PUT", METADATA_ROUTES["file_tags"], json_body=body)
+
+    def metadata_tag_files(self, tag_id: str) -> Any:
+        tag_id = validate_metadata_id("tag_id", tag_id)
+        return self._metadata_json(
+            "GET",
+            METADATA_ROUTES["tag_files"].format(tag_id=quote(tag_id, safe="")),
+        )
+
+    def metadata_tags_files(self, body: dict[str, Any]) -> Any:
+        tags_ids = validate_metadata_body_items("tags_ids", body.get("tags_ids"))
+        for tag_id in tags_ids:
+            validate_metadata_id("tag_id", tag_id)
+        return self._metadata_json("POST", METADATA_ROUTES["tags_files"], json_body=body)
+
+    def metadata_tags_merge(self, body: dict[str, Any]) -> Any:
+        self.require_read_write()
+        validate_metadata_id("target_tag_id", body.get("target_tag_id"))
+        merged_tags_ids = validate_metadata_body_items("merged_tags_ids", body.get("merged_tags_ids"))
+        for tag_id in merged_tags_ids:
+            validate_metadata_id("tag_id", tag_id)
+        return self._metadata_json("POST", METADATA_ROUTES["merge_tags"], json_body=body)
 
     def _get_remote_file_info(self, path: str) -> dict[str, Any] | None:
         url = self._url("file/")
@@ -519,6 +1009,12 @@ class SeafileVaultClient:
         if info is None:
             raise RemoteNotFoundError(f"remote file not found: {path}")
         return info
+
+    def _parse_operation_response(self, response: httpx.Response, *secrets_to_redact: str | None) -> Any:
+        try:
+            return _sanitize_upload_value(response.json(), self.repo_token, *secrets_to_redact)
+        except ValueError:
+            return {"response_text": redact_secret(response.text[:1000], self.repo_token, *secrets_to_redact)}
 
     def _verify_remote_file_size(self, path: str, expected_size: int, *, allow_missing: bool = False) -> dict[str, Any] | None:
         info = self._get_remote_file_info(path)
@@ -575,7 +1071,15 @@ class SeafileVaultClient:
             raise SeafileVaultError("resume response uploadedBytes was outside local file size")
         return uploaded
 
-    def list_directory(self, path: str = "/", *, recursive: bool = False, type_filter: str | None = None) -> Any:
+    def list_directory(
+        self,
+        path: str = "/",
+        *,
+        recursive: bool = False,
+        type_filter: str | None = None,
+        with_thumbnail: bool = False,
+        thumbnail_size: int | None = None,
+    ) -> Any:
         path = self.validate_vault_path(path)
         params: dict[str, str] = {"path": path}
         if recursive:
@@ -584,6 +1088,10 @@ class SeafileVaultClient:
             if type_filter not in {"f", "d"}:
                 raise ValueError("type_filter must be 'f' or 'd'")
             params["type"] = type_filter
+        if with_thumbnail:
+            params["with_thumbnail"] = "true"
+            if thumbnail_size is not None:
+                params["thumbnail_size"] = str(validate_thumbnail_size(thumbnail_size))
         return self._request("GET", "dir/", params=params).json()
 
     def _directory_entries(self, data: Any) -> list[dict[str, Any]]:
@@ -707,6 +1215,102 @@ class SeafileVaultClient:
             params={"path": path},
             json={"operation": "move", "dst_dir": destination_dir},
         ).json()
+
+    def _normalize_file_operation_metadata(self, source_path: str, destination_dir: str, data: Any) -> dict[str, Any]:
+        metadata = _strip_sensitive_metadata(data)
+        result: dict[str, Any] = {"source_path": source_path, "destination_dir": destination_dir, "metadata": metadata}
+        if isinstance(metadata, dict):
+            name = metadata.get("name") or metadata.get("obj_name")
+            if isinstance(name, str) and name:
+                name = self._validate_name_segment(name)
+                result["destination_name"] = name
+                result["destination_path"] = f"/{name}" if destination_dir == "/" else f"{destination_dir}/{name}"
+        return result
+
+    def copy_file(self, source_path: str, destination_dir: str) -> dict[str, Any]:
+        self.require_read_write()
+        source_path = self._validate_non_root_path(source_path, "copy")
+        destination_dir = self.validate_vault_path(destination_dir)
+        response = self._request(
+            "POST",
+            "file/",
+            params={"path": source_path},
+            json={"operation": "copy", "dst_dir": destination_dir},
+        )
+        return self._normalize_file_operation_metadata(source_path, destination_dir, response.json())
+
+    def copy_directory(self, source_path: str, destination_dir: str) -> dict[str, Any]:
+        self.require_read_write()
+        source_path = self._validate_non_root_path(source_path, "copy")
+        destination_dir = self.validate_vault_path(destination_dir)
+        source_parent, source_name = self._split_file_path(source_path)
+        if destination_dir == source_parent:
+            raise PathSecurityError("directory copy destination must differ from the source parent directory")
+        if destination_dir == source_path or destination_dir.startswith(f"{source_path}/"):
+            raise PathSecurityError("cannot copy a directory into itself or one of its descendants")
+        response = self._request(
+            "POST",
+            "sync-batch-copy-item/",
+            json={
+                "src_parent_dir": source_parent,
+                "src_dirents": [source_name],
+                "dst_parent_dir": destination_dir,
+            },
+        )
+        return {
+            "source_path": source_path,
+            "destination_directory": destination_dir,
+            "destination_path": f"/{source_name}" if destination_dir == "/" else f"{destination_dir}/{source_name}",
+            "type": "dir",
+            "server_result": _strip_sensitive_metadata(response.json()),
+        }
+
+    def copy_path(self, source_path: str, destination_dir: str, *, is_directory: bool = False) -> dict[str, Any]:
+        if is_directory:
+            return self.copy_directory(source_path, destination_dir)
+        return self.copy_file(source_path, destination_dir)
+
+    def lock_file(self, path: str, expires_seconds: int) -> Any:
+        self.require_read_write()
+        path = self._validate_non_root_path(path, "lock")
+        try:
+            expires_seconds = validate_lock_expiry_seconds("expires_seconds", expires_seconds)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+        return self._put_file_operation(path, {"operation": "lock", "expire": expires_seconds}, context="lock")
+
+    def unlock_file(self, path: str) -> Any:
+        self.require_read_write()
+        path = self._validate_non_root_path(path, "unlock")
+        return self._put_file_operation(path, {"operation": "unlock"}, context="unlock", detect_not_locked=True)
+
+    def _put_file_operation(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        context: str,
+        detect_not_locked: bool = False,
+    ) -> Any:
+        url = self._url("file/")
+        try:
+            response = self.http.put(url, headers=self._headers, params={"path": path}, json=payload)
+        except httpx.HTTPError as exc:
+            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, url)) from None
+        if response.status_code == 404:
+            raise RemoteNotFoundError(f"remote file not found: {path}")
+        if detect_not_locked and response.status_code in {400, 409}:
+            body = response.text[:1000]
+            lowered = body.lower()
+            if "not lock" in lowered or "unlocked" in lowered or "unlock" in lowered:
+                raise LockNotActiveError(f"remote file is not locked: {path}")
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text[:1000] if exc.response is not None else ""
+            status = exc.response.status_code if exc.response else "error"
+            raise SeafileVaultError(redact_secret(f"Seafile {context} HTTP {status}: {body}", self.repo_token, url)) from None
+        return self._parse_operation_response(response, url)
 
     def delete_path(self, path: str, *, recursive: bool = False) -> Any:
         self.require_read_write()
@@ -851,6 +1455,125 @@ class SeafileVaultClient:
             raise
         except OSError as exc:
             raise LocalFileError(f"download destination failed: {exc.strerror or exc}") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name, dir_fd=destination.parent_fd)
+                except FileNotFoundError:
+                    pass
+            destination.close()
+
+    def _thumbnail_api_url(self, remote_path: str, size: int) -> str:
+        repo_id = self._repo_id()
+        base = f"{self.server_url}/api2/repos/{quote(repo_id, safe='')}/thumbnail/"
+        return str(httpx.URL(base, params={"p": remote_path, "size": str(size)}))
+
+    def _redirect_target(self, current_url: str, response: httpx.Response, thumbnail_url: str) -> str:
+        location = response.headers.get("location")
+        if not location:
+            raise SeafileVaultError("thumbnail redirect did not include a location")
+        target = urljoin(current_url, location)
+        try:
+            return self._validate_same_origin_url(target, "thumbnail redirect")
+        except LinkSecurityError as exc:
+            raise LinkSecurityError(self._redact(str(exc), thumbnail_url, target)) from None
+
+    def download_thumbnail_path(
+        self,
+        remote_path: str,
+        local_path: str | os.PathLike[str],
+        *,
+        size: int = DEFAULT_THUMBNAIL_SIZE,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        remote_path = self._validate_non_root_path(remote_path, "thumbnail")
+        size = validate_thumbnail_size(size)
+        account_headers = self._account_headers
+        thumbnail_url = self._thumbnail_api_url(remote_path, size)
+        destination = self._open_download_parent(local_path)
+        fd: int | None = None
+        tmp_name: str | None = None
+        total = 0
+        content_type = ""
+        try:
+            self._validate_download_destination(destination, overwrite=overwrite)
+            tmp_name = f".{destination.name}.seafile-vault-{secrets.token_hex(16)}.tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_CLOEXEC"):
+                flags |= os.O_CLOEXEC
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(tmp_name, flags, 0o600, dir_fd=destination.parent_fd)
+            current_url = thumbnail_url
+            for _redirect in range(6):
+                with self.http.stream("GET", current_url, headers=account_headers, follow_redirects=False) as resp:
+                    if resp.status_code in {301, 302, 303, 307, 308}:
+                        current_url = self._redirect_target(current_url, resp, thumbnail_url)
+                        continue
+                    try:
+                        self._validate_same_origin_url(str(resp.url), "thumbnail final")
+                    except LinkSecurityError as exc:
+                        raise LinkSecurityError(self._redact(str(exc), thumbnail_url, str(resp.url))) from None
+                    if resp.status_code in {401, 403}:
+                        raise CapabilityError("account token could not authenticate server thumbnail route")
+                    self._raise_stream_status(resp, "thumbnail", thumbnail_url)
+                    content_type = resp.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                    if not content_type.startswith("image/"):
+                        if "html" in content_type:
+                            raise CapabilityError("thumbnail route returned HTML instead of an image")
+                        raise SeafileVaultError("thumbnail response content type was not image/*")
+                    declared_size: int | None = None
+                    content_length = resp.headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            declared_size = int(content_length)
+                        except ValueError as exc:
+                            raise SeafileVaultError("thumbnail response content-length was not an integer") from exc
+                        if declared_size < 0:
+                            raise SeafileVaultError("thumbnail response content-length was negative")
+                        if declared_size > MAX_THUMBNAIL_BYTES:
+                            raise SizeLimitError(f"thumbnail exceeds max size ({MAX_THUMBNAIL_BYTES} bytes)")
+                    for chunk in resp.iter_bytes():
+                        if total + len(chunk) > MAX_THUMBNAIL_BYTES:
+                            raise SizeLimitError(f"thumbnail exceeds max size ({MAX_THUMBNAIL_BYTES} bytes)")
+                        self._write_all(fd, chunk)
+                        total += len(chunk)
+                    if declared_size is not None and total != declared_size:
+                        raise SeafileVaultError("thumbnail response length did not match content-length")
+                    break
+            else:
+                raise SeafileVaultError("thumbnail redirect limit exceeded")
+            os.fsync(fd)
+            os.close(fd)
+            fd = None
+            if overwrite:
+                self._validate_download_destination(destination, overwrite=True)
+                os.replace(tmp_name, destination.name, src_dir_fd=destination.parent_fd, dst_dir_fd=destination.parent_fd)
+            else:
+                os.link(
+                    tmp_name,
+                    destination.name,
+                    src_dir_fd=destination.parent_fd,
+                    dst_dir_fd=destination.parent_fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(tmp_name, dir_fd=destination.parent_fd)
+            os.fsync(destination.parent_fd)
+            return {
+                "remote_path": remote_path,
+                "local_path": os.fspath(Path(local_path)),
+                "byte_count": total,
+                "content_type": content_type,
+                "requested_size": size,
+            }
+        except httpx.HTTPError as exc:
+            raise SeafileVaultError(self._redact(str(exc), thumbnail_url)) from None
+        except (RemoteNotFoundError, CapabilityError, LinkSecurityError, SizeLimitError):
+            raise
+        except OSError as exc:
+            raise LocalFileError(f"thumbnail destination failed: {exc.strerror or exc}") from None
         finally:
             if fd is not None:
                 os.close(fd)

@@ -1,7 +1,7 @@
 ---
 name: seafile-vault-cli
-description: Use when operating one token-scoped Seafile library through Seafile Vault CLI or its optional MCP server.
-version: 0.3.0
+description: Use when operating one token-scoped Seafile library through Seafile Vault CLI or its optional read-only MCP server.
+version: 0.4.0
 author: Sakina
 license: AGPL-3.0
 metadata:
@@ -12,48 +12,76 @@ metadata:
       - vault
       - mcp
       - secure-upload
+      - metadata
 ---
 
 # Seafile Vault CLI
 
-## Overview
+## Purpose
 
-Seafile Vault CLI is a non-interactive command line tool for exactly one Seafile library through a scoped repo token. It is designed for agent runtimes that need deterministic JSON, narrow permissions, explicit paths, and safe local-file upload behavior.
+Use this skill for one configured Seafile library scoped by `SEAFILE_REPO_TOKEN`. The CLI is deterministic JSON-first automation for listing, searching, reading, downloading, uploading, locking, history/share/thumbnail workflows, and Seafile v13 metadata views/records/tags.
 
-The optional MCP server exposes the same narrow operations, but the CLI is the primary interface and does not require MCP.
+The MCP server is read-only. Use the CLI for any mutation.
 
-## When to Use
+## Safety Rules
 
-- Inspect metadata for one configured library.
-- List or search explicit directories and read or download explicit files within size limits.
-- Generate same-origin download links returned by Seafile only when a caller explicitly needs the bearer-like temporary link.
-- Create, rename, move, delete, write, or upload explicit paths after enabling `read_write` for that process.
-- Upload large files with native Seafile multi-request chunked/resumable upload through the normal upload link.
-- Use direct-origin upload only as an optional fallback when the operator has already validated routing, TLS, firewall, and server upload limits.
+- Never put repo tokens, account tokens, authorization headers, upload links, download links, share revoke tokens, or passwords in prompts, argv, logs, docs, tests, or shell history.
+- Keep `SEAFILE_PERMISSION_MODE=read_only` unless the exact command needs mutation.
+- Use exact absolute vault paths only. Do not infer destructive targets from broad language.
+- Do not contact live Seafile unless the user explicitly asked for an operation against their configured library.
+- Do not use arbitrary URL or method calls. Use the named CLI commands only.
+- Prefer `download` over `download-link` unless the caller explicitly needs the temporary bearer-like link.
+- Public share creation must have finite expiry and `--confirm-public`; revocation must read the token from stdin and use `--confirm`.
+- Restore requires `--confirm` and a 40-character commit ID.
+- Metadata mutations require `read_write`, `--confirm`, and `--json-stdin` where documented.
 
-## When Not to Use
+## Lock Safety
 
-- Do not use for multiple libraries, account-wide automation, or admin operations.
-- Do not add course-audit or cross-source orchestration commands.
-- Do not use for glob delete, recursive bulk mutation, or unreviewed destructive cleanup.
-- Do not pass repo tokens on argv or embed secrets in prompts, logs, docs, tests, or shell history.
-- Do not use direct-origin upload unless the origin IP and upload path are approved for that environment.
+Locks need extra care. Every successful `lock` must be followed by `unlock` in a `finally` block or shell `trap`. Always audit locks before and after work. Never leave locks behind.
+
+Required shell pattern:
+
+```bash
+SEAFILE_PERMISSION_MODE=read_write seafile-vault locks
+SEAFILE_PERMISSION_MODE=read_write seafile-vault lock /docs/note.md --expires 900
+trap 'SEAFILE_PERMISSION_MODE=read_write seafile-vault unlock /docs/note.md >/dev/null || true' EXIT
+# perform the protected edit/upload here
+SEAFILE_PERMISSION_MODE=read_write seafile-vault unlock /docs/note.md
+trap - EXIT
+SEAFILE_PERMISSION_MODE=read_write seafile-vault locks
+```
+
+Required Python pattern:
+
+```python
+import subprocess
+
+path = "/docs/note.md"
+subprocess.run(["seafile-vault", "locks"], check=True)
+subprocess.run(["seafile-vault", "lock", path, "--expires", "900"], check=True)
+try:
+    # edit or upload the protected file here
+    pass
+finally:
+    subprocess.run(["seafile-vault", "unlock", path], check=False)
+    subprocess.run(["seafile-vault", "locks"], check=False)
+```
+
+Use `locks --prune` only after a normal `locks` audit proves records are stale because the server reports unlocked or the file is gone:
+
+```bash
+SEAFILE_PERMISSION_MODE=read_write seafile-vault locks
+SEAFILE_PERMISSION_MODE=read_write seafile-vault locks --prune
+SEAFILE_PERMISSION_MODE=read_write seafile-vault locks
+```
+
+Do not prune active, expired-but-server-locked, or unknown-error records without operator confirmation.
+
+Normal `unlock` refuses an untracked path. Use `unlock PATH --force-untracked --confirm` only for verified recovery after local registry loss; never use it merely to bypass the lock lifecycle.
 
 ## Setup
 
-Install current public source from GitHub:
-
-```bash
-pipx install git+https://github.com/soffits/seafile-vault-cli.git
-```
-
-Install MCP support only when needed:
-
-```bash
-pipx install 'git+https://github.com/soffits/seafile-vault-cli.git#egg=seafile-vault-cli[mcp]'
-```
-
-Configure secrets through environment variables only:
+Required environment:
 
 ```bash
 export SEAFILE_SERVER_URL="https://seafile.example.com"
@@ -61,7 +89,13 @@ export SEAFILE_REPO_TOKEN="repo-token-for-one-library"
 export SEAFILE_PERMISSION_MODE="read_only"
 ```
 
-Optional limits and upload settings:
+Optional account token, only for history/share lifecycle/thumbnail fetch:
+
+```bash
+export SEAFILE_ACCOUNT_TOKEN="account-token-for-optional-capabilities"
+```
+
+Optional limits:
 
 ```bash
 export SEAFILE_MAX_READ_SIZE=1048576
@@ -72,152 +106,156 @@ export SEAFILE_UPLOAD_CHUNK_SIZE=64MiB
 export SEAFILE_UPLOAD_DIRECT_IP="203.0.113.10"
 ```
 
-## JSON and Exit Contract
+Use profiles when an operator provides named env files:
 
-Successful commands write compact JSON to stdout:
-
-```json
-{"data":{"repo_name":"Example"},"ok":true}
+```bash
+seafile-library --list
+seafile-library docs list / --compact
+seafile-library docs metadata views list
 ```
 
-Errors write compact JSON to stderr and return nonzero:
-
-```json
-{"error":{"code":"configuration","message":"SEAFILE_SERVER_URL is required"},"ok":false}
-```
-
-Exit codes are stable: `0` success, `2` usage, `3` configuration, `4` permission, `5` path/link/local-input security, and `6` remote HTTP, Seafile, or size-limit failure.
+Profiles are strict env files under `~/.config/seafile-vault/libraries` or `SEAFILE_LIBRARY_CONFIG_DIR`. They may contain documented Seafile variables only and are read without shell evaluation.
 
 ## Read-Only Workflow
-
-Keep `SEAFILE_PERMISSION_MODE=read_only` for inspection:
 
 ```bash
 seafile-vault repo-info
 seafile-vault list /
 seafile-vault list / --recursive --type file --compact
 seafile-vault search / --name '*.md' --type file --max-results 50
-seafile-vault stat /path/file.md
-seafile-vault download /path/file.md ./file.md
-seafile-vault download-link /path/file.md
+seafile-vault stat /docs/note.md
+seafile-vault download /docs/note.md ./note.md
 ```
 
-Paths must be absolute normalized POSIX paths. Unicode is allowed. Relative paths, `.`, `..`, duplicate slashes, ASCII control characters, root file operations, and unsafe returned links are rejected.
-
-`download` is preferred over `download-link` for file retrieval. It obtains and validates the temporary same-origin link internally, never returns it, streams through the configured `httpx` client, enforces `SEAFILE_MAX_READ_SIZE`, writes through a mode-0600 temp file in the destination directory, and publishes only after the full response succeeds. Its JSON contains only `remote_path`, `local_name`, `size`, `sha256`, and `overwrite`.
-
-`stat` returns file metadata only. Missing files return structured `remote_not_found` JSON, not a successful `null` result.
-
-`list --compact` returns an agent-safe shape and omits modifier emails, lock fields, object IDs, repo IDs, repo names, and other internal metadata:
-
-```json
-{"count":1,"entries":[{"mtime":1720000000,"name":"file.md","size":123,"type":"file"}],"path":"/path"}
-```
-
-`search [REMOTE_DIR] --name GLOB [--type file|dir] [--max-results N] [--case-sensitive]` is read-only. It validates the directory path, uses the same recursive listing as `list`, applies safe shell-style glob matching to names only, and returns normalized full `path` values plus available `name`, `type`, `size`, and `mtime`. It defaults to 100 results, caps requests at 1000, and fails instead of truncating when a glob matches too many entries.
-
-## Library Profile Launcher
-
-Use `seafile-library` when operators provide named profile env files:
-
-```bash
-seafile-library --list
-seafile-library docs --help
-seafile-library docs search / --name '*.md'
-```
-
-Profiles are read from `~/.config/seafile-vault/libraries` or `SEAFILE_LIBRARY_CONFIG_DIR`. A profile name maps only to `<profile>.env`, and profile files must contain strict UTF-8 `KEY=VALUE` lines for `SEAFILE_SERVER_URL`, `SEAFILE_REPO_TOKEN`, and documented optional Seafile variables. The launcher rejects path traversal, control characters, symlinks, unsupported keys, duplicates, malformed lines, NUL bytes, insecure directory permissions, and env files readable by group or other users. Errors never include profile paths or env values.
+`list --compact` and `search` return agent-safe entries with normalized paths and no repo IDs, owner emails, modifier emails, lock owners, tokens, or internal database fields.
 
 ## Mutation Workflow
 
-Enable write mode only for the command or shell that needs it:
+Use write mode only around the command that mutates state:
 
 ```bash
 SEAFILE_PERMISSION_MODE=read_write seafile-vault mkdir /exports
-SEAFILE_PERMISSION_MODE=read_write seafile-vault mkdir /exports/2026/july --parents
-SEAFILE_PERMISSION_MODE=read_write seafile-vault rename /inbox/draft.md final.md
-SEAFILE_PERMISSION_MODE=read_write seafile-vault move /inbox/final.md /exports
+SEAFILE_PERMISSION_MODE=read_write seafile-vault mkdir /exports/2026/august --parents
+SEAFILE_PERMISSION_MODE=read_write seafile-vault rename /drafts/note.md final.md
+SEAFILE_PERMISSION_MODE=read_write seafile-vault move /drafts/final.md /exports
+SEAFILE_PERMISSION_MODE=read_write seafile-vault copy /docs/note.md /exports
+SEAFILE_PERMISSION_MODE=read_write seafile-vault copy /docs/project /exports --dir
 SEAFILE_PERMISSION_MODE=read_write seafile-vault delete /exports/final.md
 ```
 
-Uploads never overwrite unless `--overwrite` is explicit:
+Before delete, overwrite, move, rename, or a potentially large directory copy, list the exact parent and verify the target path. Directory copy refuses the same parent, the source itself, and source descendants. The CLI intentionally does not implement glob delete or recursive bulk mutation.
+
+## Upload Workflow
 
 ```bash
-SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./local.md /inbox/local.md
-SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./local.md /inbox/local.md --overwrite
+SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./local.md /docs/local.md
+SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./local.md /docs/local.md --overwrite
+SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./large.zip /exports/large.zip --chunked
+SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./large.zip /exports/large.zip --chunk-size 64MiB
 ```
 
-Plain `mkdir` never allows implicit Seafile conflict renames: it lists the exact parent first and fails if the requested exact child already exists as a file or directory. `mkdir --parents` walks each segment, skips exact existing directories, fails on file collisions, creates only missing segments, and returns `path`, `created`, and `skipped` metadata.
+The remote path must include the target filename. The CLI opens the local file once with symlink-safe flags, verifies a regular descriptor, checks size before network use, and streams from that descriptor. Native chunked upload is the preferred solution for large files and proxy body limits. Direct-origin upload is optional and should be used only after routing, TLS, firewall, and server limits are validated.
 
-## Upload Procedure
+## History, Restore, Shares, And Thumbnails
 
-The CLI opens the local upload source once with symlink-safe flags, verifies the opened descriptor is a regular file, checks size before any network call, and streams from that same descriptor.
-
-Native Seafile multi-request chunking is the primary Cloudflare-safe large-upload mechanism. Auto mode uses chunked upload for non-direct uploads larger than the effective chunk size and single-request upload for smaller files. The default chunk size is `67108864` bytes (64 MiB). Env and CLI text accepts plain bytes such as `67108864`, decimal units such as `64MB`, and binary units such as `64 MiB`; values are reported in result JSON as bytes. Configured or CLI chunk sizes are capped at `90000000` bytes, and every runtime multipart POST must have a complete request body smaller than `100000000` bytes after multipart overhead.
-
-Chunked upload uses the normal upload link and multiple multipart POST requests with the same form fields (`file`, `parent_dir`, `replace`) plus `Content-Range` and `Content-Disposition` headers. The request `Content-Disposition` filename is exactly `attachment; filename="PERCENT_ENCODED_UTF8"` for Seafile's URI-unescape behavior; it does not use `filename*`.
-
-Seafile merges and indexes the file after the final chunk. The CLI verifies `/api/v2.1/via-repo-token/file/?path=...` returns final file metadata with integer `size` exactly matching the local file before reporting chunked success, using only small bounded retries for final visibility lag.
-
-Resume uses the server `uploadedBytes` endpoint when available. If that status endpoint returns `401`, `403`, `404`, `405`, or `501`, resume is treated as unsupported, chunking starts at offset 0, and the result reports `resume_supported:false`. Do not require `Accept-Ranges`; valid deployments can return `200` with `uploadedBytes` without that header.
-
-Streaming is not chunking. A single streaming request avoids loading the whole local file into memory, but it can still exceed proxy or server request-body limits because it is one HTTP request. Chunked upload bounds each request body.
-
-Useful upload flags:
+History requires `SEAFILE_ACCOUNT_TOKEN`:
 
 ```bash
-SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./large.bin /exports/large.bin --chunked
-SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./large.bin /exports/large.bin --chunk-size 64MiB
-SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./large.bin /exports/large.bin --no-resume
-SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./small.bin /exports/small.bin --single-request
+seafile-vault history library --page 1 --per-page 100
+seafile-vault history file /docs/note.md --cursor 0123456789abcdef0123456789abcdef01234567
 ```
 
-Chunked result JSON includes safe metadata only: `upload_mode:"chunked"`, `chunk_size` in bytes, `chunks_sent`, `resumed_from`, `resume_supported`, `size`, `remote_path`, `overwrite`, `direct_origin:false`, and a sanitized final result. Token-bearing upload links and local paths are not returned.
-
-## Direct-Origin Procedure
-
-For approved large uploads, route only the upload connection to an explicit origin IP while preserving the Seafile upload-link hostname for HTTP Host and TLS/SNI:
+Restore requires repo-token write mode and explicit confirmation:
 
 ```bash
-SEAFILE_PERMISSION_MODE=read_write seafile-vault upload ./large.bin /exports/large.bin --direct-ip 203.0.113.10
+SEAFILE_PERMISSION_MODE=read_write seafile-vault restore file /docs/note.md --commit 0123456789abcdef0123456789abcdef01234567 --confirm
+SEAFILE_PERMISSION_MODE=read_write seafile-vault restore dir /docs/archive --commit 0123456789abcdef0123456789abcdef01234567 --confirm
 ```
 
-Use direct origin only after confirming the origin accepts direct connections, the certificate matches the hostname, firewall rules allow the request, and server-side upload and timeout limits are high enough.
-
-Direct-origin upload is an optional fallback, not a universal large-upload solution. In auto mode, configured direct-origin upload preserves the existing single-request direct behavior. Explicit `--chunked` with direct-origin routing is rejected with deterministic configuration JSON.
-
-## Destructive-Action Safety
-
-Destructive actions require an explicit command, an explicit path, and `read_write` mode. Root rename, root move, root delete, glob delete, and bulk delete are intentionally unsupported.
-
-Before delete or overwrite, list the exact parent directory and verify the target path. Do not infer targets from broad user language; ask for the exact path when it is missing.
-
-## Common Pitfalls
-
-- A missing repo token or invalid permission mode returns a configuration JSON error.
-- Write commands in `read_only` return a permission JSON error.
-- Single-request uploads can fail at a CDN or reverse proxy before reaching Seafile if request body limits are lower than the file size.
-- Use native chunked upload first for Cloudflare-safe large uploads; direct-origin is environment-specific fallback only.
-- Direct-origin upload still uses the Seafile hostname for Host and TLS/SNI; do not replace the upload URL host with an IP.
-- Token-bearing upload and download links are bearer-like secrets; keep them out of argv, logs, issues, and examples.
-- Install `seafile-vault-cli[mcp]` before running `seafile-vault-mcp`; without the extra it exits with deterministic configuration JSON on stderr.
-
-## Verification Checklist
-
-For development or release checks:
+Share lifecycle requires `SEAFILE_ACCOUNT_TOKEN`; create/revoke also require write mode:
 
 ```bash
-uv sync --extra dev
-uv run ruff check .
-uv run python -m pytest -p no:cacheprovider
+seafile-vault share list
+SEAFILE_PERMISSION_MODE=read_write seafile-vault share create /docs/note.md --expire-days 7 --permission view-only --confirm-public
+printf '%s\n' "$SHARE_TOKEN" | SEAFILE_PERMISSION_MODE=read_write seafile-vault share revoke --token-stdin --confirm
+```
+
+Thumbnail local-file workflow for agent vision:
+
+```bash
+seafile-vault thumbnail /images/diagram.png ./diagram-thumb.png --size 256 --overwrite
+```
+
+Thumbnail failures are explicit. The CLI never falls back to downloading the original file.
+
+## Metadata Workflow
+
+Metadata uses Seafile v13 repo-token metadata routes. Reads work in read-only mode:
+
+```bash
+seafile-vault metadata views list
+seafile-vault metadata views get VIEW_ID
+seafile-vault metadata records list VIEW_ID --start 0 --limit 100
+seafile-vault metadata tags status
+seafile-vault metadata tags list --start 0 --limit 100
+seafile-vault metadata tags files TAG_ID
+printf '%s\n' '{"tags_ids":["TAG_ID"]}' | seafile-vault metadata files tags --json-stdin
+```
+
+Mutations require `read_write`, `--confirm`, and JSON stdin for server-native bodies:
+
+```bash
+printf '%s\n' '{"records_data":[{"record_id":"REC_ID","record":{"name":"Updated"}}]}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata records update --json-stdin --confirm
+printf '%s\n' '{"name":"Review","type":"table","data":{}}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata views create --json-stdin --confirm
+printf '%s\n' '{"view_id":"VIEW_ID","view_data":{"name":"Review 2"}}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata views update --json-stdin --confirm
+printf '%s\n' '{"view_id":"VIEW_ID"}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata views delete --json-stdin --confirm
+SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata tags enable --lang en --confirm
+SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata tags disable --confirm
+printf '%s\n' '{"tags_data":[{"name":"Important"}]}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata tags create --json-stdin --confirm
+printf '%s\n' '{"tags_data":[{"tag_id":"TAG_ID","tag":{"name":"Renamed"}}]}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata tags update --json-stdin --confirm
+printf '%s\n' '{"tag_ids":["TAG_ID"]}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata tags delete --json-stdin --confirm
+printf '%s\n' '{"link_column_key":"parent_links","row_id_map":{"TAG_ID":["PARENT_TAG_ID"]}}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata tag-links create --json-stdin --confirm
+printf '%s\n' '{"file_tags_data":[{"record_id":"REC_ID","tags":["TAG_ID"]}]}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata files assign-tags --json-stdin --confirm
+printf '%s\n' '{"target_tag_id":"TAG_ID","merged_tags_ids":["OLD_TAG_ID"]}' | SEAFILE_PERMISSION_MODE=read_write seafile-vault metadata tags merge --json-stdin --confirm
+```
+
+JSON stdin must be exactly one UTF-8 JSON object, no trailing data, capped at 262144 bytes. Metadata-disabled and tags-disabled responses return `capability` errors with actionable messages.
+
+## MCP Workflow
+
+Install the optional extra before running MCP:
+
+```bash
+pipx install 'git+https://github.com/soffits/seafile-vault-cli.git#egg=seafile-vault-cli[mcp]'
+seafile-vault-mcp
+```
+
+MCP exposes read-only tools only: repo info, directory list, name search, text read, download link, library/file history, current-library share list, metadata views list/get, metadata records list, metadata tags status/list, and tag files. It does not expose share creation/revocation, restore, lock/unlock, writes, uploads, moves, renames, deletes, or metadata mutations.
+
+## JSON Contract
+
+Success goes to stdout:
+
+```json
+{"data":{"repo_name":"Example"},"ok":true}
+```
+
+Errors go to stderr:
+
+```json
+{"error":{"code":"permission_denied","message":"write operation blocked: set SEAFILE_PERMISSION_MODE=read_write"},"ok":false}
+```
+
+Exit codes: `0` success, `2` usage, `3` configuration or unsupported capability, `4` permission, `5` path/link/local-input security, `6` remote HTTP, Seafile, size-limit, or lock-registry failure.
+
+## Verification
+
+```bash
+uv sync --extra dev --extra mcp
+uv run ruff check src tests pyproject.toml
+uv run pytest
 uv build
 uv run seafile-vault --help
-uv run seafile-vault list --help
-uv run seafile-vault search --help
-uv run seafile-vault download --help
-uv run seafile-vault upload --help
+uv run seafile-vault metadata --help
 uv run seafile-library --help
-uv run seafile-library --version
 ```
-
-Inspect built artifacts before publishing: the wheel should include `seafile_vault_cli/SKILL.md`, a complete license file, and entry points for `seafile-vault`, `seafile-library`, and `seafile-vault-mcp`; the sdist should include root `SKILL.md` and `LICENSE`.

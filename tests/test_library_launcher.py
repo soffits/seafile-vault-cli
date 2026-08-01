@@ -29,7 +29,7 @@ def test_library_launcher_global_help_and_version_do_not_require_profile():
         check=False,
     )
     assert version_result.returncode == 0
-    assert "0.3.0" in version_result.stdout
+    assert "0.4.0" in version_result.stdout
 
 
 def test_library_launcher_list_returns_compact_json(tmp_path, monkeypatch, capsys):
