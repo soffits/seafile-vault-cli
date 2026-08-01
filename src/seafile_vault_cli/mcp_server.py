@@ -4,7 +4,7 @@ import json
 import sys
 from typing import Any
 
-from .cli import EXIT_CONFIG
+from .cli import EXIT_CONFIG, SEARCH_DEFAULT_MAX_RESULTS, SEARCH_HARD_MAX_RESULTS, _search_results
 from .client import SeafileVaultClient
 
 
@@ -33,6 +33,32 @@ def build_server() -> Any:
             return client.list_directory(path)
 
     @mcp.tool()
+    def seafile_vault_search_by_name(
+        path: str = "/",
+        name: str = "*",
+        type_filter: str | None = None,
+        max_results: int = SEARCH_DEFAULT_MAX_RESULTS,
+        case_sensitive: bool = False,
+    ) -> dict[str, Any]:
+        """Search one directory recursively with the same safe glob rules as the CLI."""
+        with _client() as client:
+            base_path = client.validate_vault_path(path)
+            if type_filter not in {"file", "dir", None}:
+                raise ValueError("type_filter must be file or dir")
+            if max_results < 1 or max_results > SEARCH_HARD_MAX_RESULTS:
+                raise ValueError(f"max_results must be between 1 and {SEARCH_HARD_MAX_RESULTS}")
+            remote_type = {"file": "f", "dir": "d", None: None}[type_filter]
+            data = client.list_directory(base_path, recursive=True, type_filter=remote_type)
+            return _search_results(
+                base_path,
+                data,
+                pattern=name,
+                type_filter=type_filter,
+                max_results=max_results,
+                case_sensitive=case_sensitive,
+            )
+
+    @mcp.tool()
     def seafile_vault_read_text_file(path: str) -> str:
         """Read a UTF-8 text file, enforcing SEAFILE_MAX_READ_SIZE."""
         with _client() as client:
@@ -45,40 +71,58 @@ def build_server() -> Any:
             return client.get_download_link(path)
 
     @mcp.tool()
-    def seafile_vault_create_directory(path: str) -> Any:
-        """Create a directory when SEAFILE_PERMISSION_MODE=read_write."""
+    def seafile_vault_library_history(page: int = 1, per_page: int = 100) -> Any:
+        """Show library history when SEAFILE_ACCOUNT_TOKEN is configured."""
         with _client() as client:
-            return client.create_directory(path)
+            return client.library_history(page=page, per_page=per_page)
 
     @mcp.tool()
-    def seafile_vault_rename_path(path: str, new_name: str, is_directory: bool = False) -> Any:
-        """Rename one file or directory when SEAFILE_PERMISSION_MODE=read_write."""
+    def seafile_vault_file_history(path: str, cursor: str | None = None) -> Any:
+        """Show file history when SEAFILE_ACCOUNT_TOKEN is configured."""
         with _client() as client:
-            return client.rename_path(path, new_name, is_directory=is_directory)
+            return client.file_history(path, cursor=cursor)
 
     @mcp.tool()
-    def seafile_vault_move_path(path: str, destination_dir: str, is_directory: bool = False) -> Any:
-        """Move one file or directory when SEAFILE_PERMISSION_MODE=read_write."""
+    def seafile_vault_share_links() -> dict[str, Any]:
+        """List current-library public share links when SEAFILE_ACCOUNT_TOKEN is configured."""
         with _client() as client:
-            return client.move_path(path, destination_dir, is_directory=is_directory)
+            return client.list_share_links()
 
     @mcp.tool()
-    def seafile_vault_delete_path(path: str, recursive: bool = False) -> Any:
-        """Delete one explicit path when SEAFILE_PERMISSION_MODE=read_write."""
+    def seafile_vault_metadata_views() -> Any:
+        """List metadata views for the configured library."""
         with _client() as client:
-            return client.delete_path(path, recursive=recursive)
+            return client.metadata_views_list()
 
     @mcp.tool()
-    def seafile_vault_write_text_file(path: str, text: str, overwrite: bool = False) -> Any:
-        """Write UTF-8 text when SEAFILE_PERMISSION_MODE=read_write."""
+    def seafile_vault_metadata_view(view_id: str) -> Any:
+        """Get one metadata view by ID."""
         with _client() as client:
-            return client.write_text_file(path, text, overwrite=overwrite)
+            return client.metadata_view_get(view_id)
 
     @mcp.tool()
-    def seafile_vault_upload_file_base64(path: str, content_base64: str, overwrite: bool = False) -> Any:
-        """Upload base64 content when SEAFILE_PERMISSION_MODE=read_write."""
+    def seafile_vault_metadata_records(view_id: str, start: int = 0, limit: int = 1000) -> Any:
+        """List metadata records in one view."""
         with _client() as client:
-            return client.upload_file_base64(path, content_base64, overwrite=overwrite)
+            return client.metadata_records_list(view_id, start=start, limit=limit)
+
+    @mcp.tool()
+    def seafile_vault_metadata_tags_status() -> dict[str, Any]:
+        """Check whether metadata tags are enabled for the configured library."""
+        with _client() as client:
+            return client.metadata_tags_status()
+
+    @mcp.tool()
+    def seafile_vault_metadata_tags(start: int = 0, limit: int = 1000) -> Any:
+        """List metadata tags for the configured library."""
+        with _client() as client:
+            return client.metadata_tags_list(start=start, limit=limit)
+
+    @mcp.tool()
+    def seafile_vault_metadata_tag_files(tag_id: str) -> Any:
+        """List files linked to one metadata tag."""
+        with _client() as client:
+            return client.metadata_tag_files(tag_id)
 
     return mcp
 

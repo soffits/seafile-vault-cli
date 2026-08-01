@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import types
+from datetime import UTC, datetime
 
 import pytest
 
@@ -56,6 +57,31 @@ def test_cli_rename_and_move_support_dir_selector():
     assert rename_args.dir is True
     move_args = build_parser().parse_args(["move", "/old", "/archive", "--dir"])
     assert move_args.dir is True
+
+
+def test_cli_copy_lock_and_locks_parsers():
+    from seafile_vault_cli.cli import build_parser
+
+    copy_args = build_parser().parse_args(["copy", "/source.txt", "/archive"])
+    assert copy_args.command == "copy"
+    assert copy_args.source == "/source.txt"
+    assert copy_args.destination_directory == "/archive"
+    lock_args = build_parser().parse_args(["lock", "/source.txt", "--expires", "120"])
+    assert lock_args.command == "lock"
+    assert lock_args.expires == 120
+    locks_args = build_parser().parse_args(["locks", "--prune"])
+    assert locks_args.command == "locks"
+    assert locks_args.prune is True
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "86401"])
+def test_cli_lock_parser_rejects_invalid_expires(capsys, value):
+    from seafile_vault_cli.cli import build_parser
+
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["lock", "/source.txt", "--expires", value])
+    assert excinfo.value.code == 2
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "usage"
 
 
 def test_cli_list_parser_accepts_recursive_type_and_compact():
@@ -427,6 +453,203 @@ def test_cli_download_stat_and_mkdir_json_calls(monkeypatch, capsys):
     assert calls == [("download", "/remote.txt", "local.txt", True), ("stat", "/remote.txt"), ("mkdir", "/a/b", True)]
 
 
+def test_cli_copy_json_call(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def copy_path(self, source, destination_directory, *, is_directory):
+            assert (source, destination_directory, is_directory) == ("/source.txt", "/archive", False)
+            return {"destination_path": "/archive/source.txt"}
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    assert cli.main(["copy", "/source.txt", "/archive"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "data": {"destination_path": "/archive/source.txt"}}
+
+
+def test_cli_copy_directory_dispatch(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def copy_path(self, source, destination_directory, *, is_directory):
+            assert (source, destination_directory, is_directory) == ("/source", "/archive", True)
+            return {"destination_path": "/archive/source", "type": "dir"}
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    assert cli.main(["copy", "/source", "/archive", "--dir"]) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["type"] == "dir"
+
+
+def test_cli_lock_rolls_back_server_lock_when_registry_persistence_fails(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+    from seafile_vault_cli.lock_registry import LockRegistryError
+
+    calls = []
+
+    class FakeClient:
+        server_url = "https://seafile.example.com"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def validate_vault_path(self, path):
+            return path
+
+        def get_repo_info(self):
+            return {"repo_id": "11111111-2222-3333-4444-555555555555"}
+
+        def lock_file(self, path, expires_seconds):
+            calls.append(("lock", path, expires_seconds))
+            return {"success": True}
+
+        def unlock_file(self, path):
+            calls.append(("unlock", path))
+            return {"success": True}
+
+    class FailingRegistry:
+        def add(self, *_args, **_kwargs):
+            raise LockRegistryError("disk full")
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    monkeypatch.setattr(cli, "_registry", lambda: FailingRegistry())
+    assert cli.main(["lock", "/source.txt", "--expires", "120"]) == 6
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert payload["error"]["code"] == "lockregistry"
+    assert "rolled back" in payload["error"]["message"]
+    assert calls == [("lock", "/source.txt", 120), ("unlock", "/source.txt")]
+
+
+def test_cli_lock_rollback_failure_requires_manual_unlock(monkeypatch, capsys):
+    from seafile_vault_cli import cli
+    from seafile_vault_cli.client import SeafileVaultError
+    from seafile_vault_cli.lock_registry import LockRegistryError
+
+    class FakeClient:
+        server_url = "https://seafile.example.com"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def validate_vault_path(self, path):
+            return path
+
+        def get_repo_info(self):
+            return {"repo_id": "11111111-2222-3333-4444-555555555555"}
+
+        def lock_file(self, path, expires_seconds):
+            return {"success": True}
+
+        def unlock_file(self, path):
+            raise SeafileVaultError("remote refused")
+
+    class FailingRegistry:
+        def add(self, *_args, **_kwargs):
+            raise LockRegistryError("readonly filesystem")
+
+    monkeypatch.setattr(cli.SeafileVaultClient, "from_env", lambda: FakeClient())
+    monkeypatch.setattr(cli, "_registry", lambda: FailingRegistry())
+    assert cli.main(["lock", "/source.txt"]) == 6
+    payload = json.loads(capsys.readouterr().err)
+    assert payload["error"]["code"] == "seafilevault"
+    assert "manual unlock is required" in payload["error"]["message"]
+
+
+def test_unlock_refuses_untracked_lock_without_explicit_recovery_confirmation():
+    from seafile_vault_cli.cli import _unlock_file_lifecycle
+    from seafile_vault_cli.client import ConfigError
+    from seafile_vault_cli.lock_registry import LockRegistryError
+
+    calls = []
+
+    class FakeClient:
+        server_url = "https://seafile.example.com"
+
+        def get_repo_info(self):
+            return {"repo_id": "11111111-2222-3333-4444-555555555555"}
+
+        def validate_vault_path(self, path):
+            return path
+
+        def unlock_file(self, path):
+            calls.append(path)
+            return {"success": True}
+
+    class EmptyRegistry:
+        def list(self, _identity):
+            return []
+
+    client = FakeClient()
+    registry = EmptyRegistry()
+    with pytest.raises(LockRegistryError, match="possibly foreign"):
+        _unlock_file_lifecycle(client, "/note.txt", registry)
+    with pytest.raises(ConfigError, match="requires --confirm"):
+        _unlock_file_lifecycle(client, "/note.txt", registry, force_untracked=True)
+    result = _unlock_file_lifecycle(client, "/note.txt", registry, force_untracked=True, confirmed=True)
+    assert result["forced_untracked"] is True
+    assert result["tracked_by_this_client"] is False
+    assert calls == ["/note.txt"]
+
+
+def test_cli_locks_audit_prune_removes_only_proven_stale(tmp_path):
+    from seafile_vault_cli.cli import _list_lock_lifecycle
+    from seafile_vault_cli.lock_registry import LockRegistry, build_library_identity
+
+    identity = build_library_identity("https://seafile.example.com", "11111111-2222-3333-4444-555555555555")
+    registry = LockRegistry(tmp_path / "locks.json")
+    acquired = datetime(2026, 1, 1, tzinfo=UTC)
+    registry.add(identity, "/active.txt", 3600, acquired_at=acquired)
+    registry.add(identity, "/stale.txt", 3600, acquired_at=acquired)
+    registry.add(identity, "/missing.txt", 3600, acquired_at=acquired)
+    registry.add(identity, "/error.txt", 3600, acquired_at=acquired)
+
+    class FakeClient:
+        server_url = "https://seafile.example.com"
+
+        def get_repo_info(self):
+            return {"repo_id": identity.repo_id}
+
+        def stat_file(self, path):
+            from seafile_vault_cli.client import RemoteNotFoundError, SeafileVaultError
+
+            if path == "/active.txt":
+                return {"name": "active.txt", "size": 1, "is_locked": True}
+            if path == "/stale.txt":
+                return {"name": "stale.txt", "size": 1, "is_locked": False}
+            if path == "/missing.txt":
+                raise RemoteNotFoundError("remote file not found: /missing.txt")
+            raise SeafileVaultError("temporary server failure")
+
+    result = _list_lock_lifecycle(FakeClient(), prune=True, registry=registry)
+    statuses = {item["path"]: item["status"] for item in result["locks"]}
+    assert statuses == {
+        "/active.txt": "expired_but_server_locked",
+        "/stale.txt": "stale",
+        "/missing.txt": "file_not_found",
+        "/error.txt": "server_error",
+    }
+    assert result["pruned"] == ["/missing.txt", "/stale.txt"]
+    remaining = [record.path for record in registry.list(identity)]
+    assert remaining == ["/active.txt", "/error.txt"]
+
+
 def test_cli_upload_json_passes_chunked_flags(monkeypatch, capsys):
     from seafile_vault_cli import cli
 
@@ -576,7 +799,7 @@ def test_mcp_missing_extra_exits_deterministic_json(monkeypatch, capsys):
     assert "Traceback" not in captured.err
 
 
-def test_mcp_server_registers_mutation_tool_names(monkeypatch):
+def test_mcp_server_registers_read_only_tool_names(monkeypatch):
     class FakeFastMCP:
         def __init__(self, name):
             self.name = name
@@ -603,12 +826,20 @@ def test_mcp_server_registers_mutation_tool_names(monkeypatch):
 
     server = build_server()
     assert server.name == "seafile-vault-cli"
-    assert "seafile_vault_rename_path" in server.tools
-    assert "seafile_vault_move_path" in server.tools
-    assert "seafile_vault_delete_path" in server.tools
+    assert "seafile_vault_search_by_name" in server.tools
+    assert "seafile_vault_library_history" in server.tools
+    assert "seafile_vault_share_links" in server.tools
+    assert "seafile_vault_metadata_views" in server.tools
+    assert "seafile_vault_metadata_tag_files" in server.tools
+    assert "seafile_vault_rename_path" not in server.tools
+    assert "seafile_vault_move_path" not in server.tools
+    assert "seafile_vault_delete_path" not in server.tools
+    assert "seafile_vault_write_text_file" not in server.tools
+    assert "seafile_vault_lock_path" not in server.tools
+    assert "seafile_vault_unlock_path" not in server.tools
 
 
-def test_mcp_rename_and_move_expose_is_directory(monkeypatch):
+def test_mcp_metadata_records_exposes_pagination(monkeypatch):
     class FakeFastMCP:
         def __init__(self, name):
             self.name = name
@@ -634,5 +865,52 @@ def test_mcp_rename_and_move_expose_is_directory(monkeypatch):
     from seafile_vault_cli.mcp_server import build_server
 
     server = build_server()
-    assert inspect.signature(server.tools["seafile_vault_rename_path"]).parameters["is_directory"].default is False
-    assert inspect.signature(server.tools["seafile_vault_move_path"]).parameters["is_directory"].default is False
+    signature = inspect.signature(server.tools["seafile_vault_metadata_records"])
+    assert signature.parameters["start"].default == 0
+    assert signature.parameters["limit"].default == 1000
+
+
+def test_mcp_search_uses_existing_safe_results(monkeypatch):
+    class FakeFastMCP:
+        def __init__(self, name):
+            self.name = name
+            self.tools = {}
+
+        def tool(self):
+            def decorator(func):
+                self.tools[func.__name__] = func
+                return func
+
+            return decorator
+
+    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
+    fake_fastmcp.FastMCP = FakeFastMCP
+    fake_server = types.ModuleType("mcp.server")
+    fake_server.fastmcp = fake_fastmcp
+    fake_mcp = types.ModuleType("mcp")
+    fake_mcp.server = fake_server
+    monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
+    monkeypatch.setitem(sys.modules, "mcp.server", fake_server)
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
+
+    import seafile_vault_cli.mcp_server as mcp_server
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def validate_vault_path(self, path):
+            assert path == "/docs"
+            return path
+
+        def list_directory(self, path, *, recursive, type_filter):
+            assert (path, recursive, type_filter) == ("/docs", True, "f")
+            return [{"name": "note.md", "type": "file", "parent_dir": "/docs", "size": 1}]
+
+    monkeypatch.setattr(mcp_server, "_client", lambda: FakeClient())
+    server = mcp_server.build_server()
+    result = server.tools["seafile_vault_search_by_name"]("/docs", "*.md", "file", 10, False)
+    assert result["results"] == [{"path": "/docs/note.md", "name": "note.md", "type": "file", "size": 1}]
