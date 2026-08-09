@@ -33,7 +33,7 @@ Issues = "https://github.com/soffits/seafile-vault-cli/issues"
 Security = "https://github.com/soffits/seafile-vault-cli/security"
 
 [project.optional-dependencies]
-dev = ["build>=1.2", "pytest>=9.1.1", "ruff>=0.8"]
+dev = ["build>=1.2", "pytest>=9.1.1", "ruff>=0.16.1"]
 mcp = ["mcp>=1.28.1,<2"]
 
 [project.scripts]
