@@ -11,6 +11,7 @@ def test_config_from_env_defaults_to_read_only_and_parses_limits(monkeypatch):
     monkeypatch.setenv("SEAFILE_REPO_TOKEN", "super-secret-token")
     for name in [
         "SEAFILE_PERMISSION_MODE",
+        "SEAFILE_MAX_DOWNLOAD_SIZE",
         "SEAFILE_MAX_READ_SIZE",
         "SEAFILE_MAX_WRITE_SIZE",
         "SEAFILE_UPLOAD_TIMEOUT",
@@ -23,11 +24,33 @@ def test_config_from_env_defaults_to_read_only_and_parses_limits(monkeypatch):
     assert cfg.server_url == "https://seafile.example.com"
     assert cfg.repo_token == "super-secret-token"
     assert cfg.permission_mode == "read_only"
+    assert cfg.max_download_size is None
     assert cfg.max_read_size == 1024 * 1024
     assert cfg.max_write_size == 10 * 1024 * 1024
     assert cfg.request_timeout == 12.5
     assert cfg.upload_timeout == 3600
     assert cfg.upload_chunk_size == 64 * 1024 * 1024
+
+
+def test_config_from_env_parses_optional_download_limit(monkeypatch):
+    monkeypatch.setenv("SEAFILE_SERVER_URL", "https://seafile.example.com")
+    monkeypatch.setenv("SEAFILE_REPO_TOKEN", "super-secret-token")
+    monkeypatch.setenv("SEAFILE_MAX_DOWNLOAD_SIZE", "2097152")
+
+    cfg = Config.from_env()
+
+    assert cfg.max_download_size == 2 * 1024 * 1024
+
+
+def test_config_from_env_accepts_arbitrarily_large_download_limit(monkeypatch):
+    monkeypatch.setenv("SEAFILE_SERVER_URL", "https://seafile.example.com")
+    monkeypatch.setenv("SEAFILE_REPO_TOKEN", "super-secret-token")
+    huge_limit = 10**1000
+    monkeypatch.setenv("SEAFILE_MAX_DOWNLOAD_SIZE", str(huge_limit))
+
+    cfg = Config.from_env()
+
+    assert cfg.max_download_size == huge_limit
 
 
 def test_config_from_env_parses_read_write_and_direct_ip(monkeypatch):
@@ -187,6 +210,8 @@ def test_same_origin_comparison_normalizes_default_ports():
     [
         {"repo_token": ""},
         {"repo_token": "   "},
+        {"max_download_size": 0},
+        {"max_download_size": 1.5},
         {"max_read_size": 0},
         {"max_read_size": 1.5},
         {"max_write_size": -1},
@@ -206,6 +231,29 @@ def test_client_constructor_arguments_fail_closed(kwargs):
     params = {"repo_token": "secret"} | kwargs
     with pytest.raises(ConfigError):
         SeafileVaultClient("https://seafile.example.com", **params)
+
+
+def test_config_preserves_pre_0_4_1_positional_field_order():
+    cfg = Config(
+        "https://seafile.example.com",
+        "secret",
+        None,
+        "read_only",
+        2,
+        3,
+        4.0,
+        5.0,
+        6,
+        None,
+    )
+
+    assert cfg.max_read_size == 2
+    assert cfg.max_write_size == 3
+    assert cfg.request_timeout == 4.0
+    assert cfg.upload_timeout == 5.0
+    assert cfg.upload_chunk_size == 6
+    assert cfg.upload_direct_ip is None
+    assert cfg.max_download_size is None
 
 
 def test_owned_http_client_uses_supplied_request_timeout():

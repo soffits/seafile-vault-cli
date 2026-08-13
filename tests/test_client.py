@@ -221,6 +221,46 @@ def test_download_file_path_streams_to_0600_temp_and_returns_hash(tmp_path):
     assert str(requests[1].url) == "https://seafile.example.com/file-secret"
 
 
+def test_download_file_path_has_no_default_file_size_limit(tmp_path):
+    content = b"x" * (1024 * 1024 + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=content, headers={"content-length": str(len(content))})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+    dest = tmp_path / "large.bin"
+
+    result = client.download_file_path("/large.bin", dest)
+
+    assert result["size"] == len(content)
+    assert dest.read_bytes() == content
+
+
+def test_download_file_path_honours_explicit_download_limit(tmp_path):
+    content = b"toolarge"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v2.1/via-repo-token/download-link/":
+            return httpx.Response(200, json="https://seafile.example.com/file")
+        return httpx.Response(200, content=content, headers={"content-length": str(len(content))})
+
+    client = SeafileVaultClient(
+        "https://seafile.example.com",
+        "super-secret-token",
+        max_download_size=7,
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+    )
+
+    with pytest.raises(SizeLimitError):
+        client.download_file_path("/large.bin", tmp_path / "large.bin")
+
+
 def test_download_file_path_handles_partial_os_write(tmp_path, monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/v2.1/via-repo-token/download-link/":
@@ -347,7 +387,7 @@ def test_download_file_path_size_limit_content_length_leaves_existing_file(tmp_p
     client = SeafileVaultClient(
         "https://seafile.example.com",
         "super-secret-token",
-        max_read_size=7,
+        max_download_size=7,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     with pytest.raises(SizeLimitError):
@@ -387,7 +427,7 @@ def test_download_file_path_size_limit_without_content_length_cleans_temp(tmp_pa
     client = SeafileVaultClient(
         "https://seafile.example.com",
         "super-secret-token",
-        max_read_size=5,
+        max_download_size=5,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
     with pytest.raises(SizeLimitError):

@@ -21,6 +21,7 @@ import httpx
 from .lock_policy import validate_lock_expiry_seconds
 
 DEFAULT_MAX_READ_SIZE = 1024 * 1024
+DEFAULT_MAX_DOWNLOAD_SIZE = None
 DEFAULT_MAX_WRITE_SIZE = 10 * 1024 * 1024
 DEFAULT_REQUEST_TIMEOUT = 30.0
 DEFAULT_UPLOAD_TIMEOUT = 3600.0
@@ -179,7 +180,20 @@ def _parse_int_env(name: str, default: int) -> int:
         value = int(raw)
     except ValueError as exc:
         raise ConfigError(f"{name} must be an integer") from exc
-    if not math.isfinite(value) or value <= 0:
+    if value <= 0:
+        raise ConfigError(f"{name} must be positive")
+    return value
+
+
+def _parse_optional_int_env(name: str, default: int | None = None) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+    if value <= 0:
         raise ConfigError(f"{name} must be positive")
     return value
 
@@ -451,6 +465,7 @@ class Config:
     upload_timeout: float = DEFAULT_UPLOAD_TIMEOUT
     upload_chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE
     upload_direct_ip: str | None = None
+    max_download_size: int | None = DEFAULT_MAX_DOWNLOAD_SIZE
 
     @classmethod
     def from_env(cls) -> Config:
@@ -468,6 +483,7 @@ class Config:
             repo_token=repo_token,
             account_token=account_token,
             permission_mode=_parse_permission_mode(os.environ.get("SEAFILE_PERMISSION_MODE")),
+            max_download_size=_parse_optional_int_env("SEAFILE_MAX_DOWNLOAD_SIZE", DEFAULT_MAX_DOWNLOAD_SIZE),
             max_read_size=_parse_int_env("SEAFILE_MAX_READ_SIZE", DEFAULT_MAX_READ_SIZE),
             max_write_size=_parse_int_env("SEAFILE_MAX_WRITE_SIZE", DEFAULT_MAX_WRITE_SIZE),
             request_timeout=_parse_float_env("SEAFILE_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT),
@@ -487,6 +503,7 @@ class SeafileVaultClient:
         *,
         account_token: str | None = None,
         permission_mode: PermissionMode | str = PermissionMode.READ_ONLY,
+        max_download_size: int | None = DEFAULT_MAX_DOWNLOAD_SIZE,
         max_read_size: int = DEFAULT_MAX_READ_SIZE,
         max_write_size: int = DEFAULT_MAX_WRITE_SIZE,
         timeout: float = DEFAULT_REQUEST_TIMEOUT,
@@ -503,6 +520,7 @@ class SeafileVaultClient:
         self.repo_token = repo_token
         self.account_token = account_token
         self.permission_mode = _parse_permission_mode(str(permission_mode))
+        self.max_download_size = None if max_download_size is None else _validate_positive_int("max_download_size", max_download_size)
         self.max_read_size = _validate_positive_int("max_read_size", max_read_size)
         self.max_write_size = _validate_positive_int("max_write_size", max_write_size)
         timeout = _validate_positive_float("timeout", timeout)
@@ -520,6 +538,7 @@ class SeafileVaultClient:
             cfg.repo_token,
             account_token=cfg.account_token,
             permission_mode=cfg.permission_mode,
+            max_download_size=cfg.max_download_size,
             max_read_size=cfg.max_read_size,
             max_write_size=cfg.max_write_size,
             timeout=cfg.request_timeout,
@@ -1416,11 +1435,11 @@ class SeafileVaultClient:
                         raise SeafileVaultError("download response content-length was not an integer") from exc
                     if declared_size < 0:
                         raise SeafileVaultError("download response content-length was negative")
-                    if declared_size > self.max_read_size:
-                        raise SizeLimitError(f"file exceeds max read size ({self.max_read_size} bytes)")
+                    if self.max_download_size is not None and declared_size > self.max_download_size:
+                        raise SizeLimitError(f"file exceeds max download size ({self.max_download_size} bytes)")
                 for chunk in resp.iter_bytes():
-                    if total + len(chunk) > self.max_read_size:
-                        raise SizeLimitError(f"file exceeds max read size ({self.max_read_size} bytes)")
+                    if self.max_download_size is not None and total + len(chunk) > self.max_download_size:
+                        raise SizeLimitError(f"file exceeds max download size ({self.max_download_size} bytes)")
                     self._write_all(fd, chunk)
                     total += len(chunk)
                     digest.update(chunk)

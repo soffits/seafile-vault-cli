@@ -29,7 +29,7 @@ def test_library_launcher_global_help_and_version_do_not_require_profile():
         check=False,
     )
     assert version_result.returncode == 0
-    assert "0.4.0" in version_result.stdout
+    assert "0.4.1" in version_result.stdout
 
 
 def test_library_launcher_list_returns_compact_json(tmp_path, monkeypatch, capsys):
@@ -95,6 +95,30 @@ def test_library_launcher_loads_profile_and_calls_cli_with_no_secret_output(tmp_
     captured = capsys.readouterr()
     assert calls == [(["repo-info"], "https://seafile.example.com", "secret-token")]
     assert "secret-token" not in captured.out
+
+
+def test_library_launcher_accepts_download_limit_in_profile(tmp_path, monkeypatch):
+    from seafile_vault_cli import library_launcher
+
+    config_dir = tmp_path / "libraries"
+    config_dir.mkdir(mode=0o700)
+    _write_profile(
+        config_dir / "docs.env",
+        "SEAFILE_SERVER_URL=https://seafile.example.com\n"
+        "SEAFILE_REPO_TOKEN=secret-token\n"
+        "SEAFILE_MAX_DOWNLOAD_SIZE=2097152\n",
+    )
+    seen = []
+
+    def fake_main(argv):
+        seen.append(os.environ.get("SEAFILE_MAX_DOWNLOAD_SIZE"))
+        return 0
+
+    monkeypatch.setenv("SEAFILE_LIBRARY_CONFIG_DIR", str(config_dir))
+    monkeypatch.setattr(library_launcher.cli, "main", fake_main)
+
+    assert library_launcher.main(["docs", "repo-info"]) == 0
+    assert seen == ["2097152"]
 
 
 def test_library_launcher_only_inherits_documented_optional_seafile_env(tmp_path, monkeypatch):

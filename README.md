@@ -63,6 +63,7 @@ Optional:
 
 ```bash
 export SEAFILE_ACCOUNT_TOKEN="account-token-for-optional-capabilities"
+export SEAFILE_MAX_DOWNLOAD_SIZE=1073741824
 export SEAFILE_MAX_READ_SIZE=1048576
 export SEAFILE_MAX_WRITE_SIZE=10485760
 export SEAFILE_REQUEST_TIMEOUT=30
@@ -70,6 +71,8 @@ export SEAFILE_UPLOAD_TIMEOUT=3600
 export SEAFILE_UPLOAD_CHUNK_SIZE=64MiB
 export SEAFILE_UPLOAD_DIRECT_IP="203.0.113.10"
 ```
+
+`download` streams directly to a mode-`0600` temporary file and has no file-size limit by default. Set `SEAFILE_MAX_DOWNLOAD_SIZE` only when an operator needs an explicit on-disk download cap. `SEAFILE_MAX_READ_SIZE` remains the in-memory limit for text, bytes, and base64 reads.
 
 Use `read_only` for inspection and short-lived `read_write` only for sessions that must mutate remote state.
 

@@ -1,7 +1,7 @@
 ---
 name: seafile-vault-cli
 description: Use when operating one token-scoped Seafile library through Seafile Vault CLI or its optional read-only MCP server.
-version: 0.4.0
+version: 0.4.1
 author: Sakina
 license: AGPL-3.0
 metadata:
@@ -98,6 +98,7 @@ export SEAFILE_ACCOUNT_TOKEN="account-token-for-optional-capabilities"
 Optional limits:
 
 ```bash
+export SEAFILE_MAX_DOWNLOAD_SIZE=1073741824
 export SEAFILE_MAX_READ_SIZE=1048576
 export SEAFILE_MAX_WRITE_SIZE=10485760
 export SEAFILE_REQUEST_TIMEOUT=30
@@ -105,6 +106,8 @@ export SEAFILE_UPLOAD_TIMEOUT=3600
 export SEAFILE_UPLOAD_CHUNK_SIZE=64MiB
 export SEAFILE_UPLOAD_DIRECT_IP="203.0.113.10"
 ```
+
+Disk downloads are streamed and have no size limit unless `SEAFILE_MAX_DOWNLOAD_SIZE` is set. `SEAFILE_MAX_READ_SIZE` only limits operations that assemble the complete result in memory, such as text, bytes, and base64 reads.
 
 Use profiles when an operator provides named env files:
 
