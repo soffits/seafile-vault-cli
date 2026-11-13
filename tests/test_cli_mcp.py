@@ -800,8 +800,8 @@ def test_mcp_missing_extra_exits_deterministic_json(monkeypatch, capsys):
 
 
 def test_mcp_server_registers_read_only_tool_names(monkeypatch):
-    class FakeFastMCP:
-        def __init__(self, name):
+    class FakeMCPServer:
+        def __init__(self, name, version=""):
             self.name = name
             self.tools = []
 
@@ -812,15 +812,15 @@ def test_mcp_server_registers_read_only_tool_names(monkeypatch):
 
             return decorator
 
-    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
-    fake_fastmcp.FastMCP = FakeFastMCP
+    fake_mcpserver = types.ModuleType("mcp.server.mcpserver")
+    fake_mcpserver.MCPServer = FakeMCPServer
     fake_server = types.ModuleType("mcp.server")
-    fake_server.fastmcp = fake_fastmcp
+    fake_server.mcpserver = fake_mcpserver
     fake_mcp = types.ModuleType("mcp")
     fake_mcp.server = fake_server
     monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
     monkeypatch.setitem(sys.modules, "mcp.server", fake_server)
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
+    monkeypatch.setitem(sys.modules, "mcp.server.mcpserver", fake_mcpserver)
 
     from seafile_vault_cli.mcp_server import build_server
 
@@ -840,8 +840,8 @@ def test_mcp_server_registers_read_only_tool_names(monkeypatch):
 
 
 def test_mcp_metadata_records_exposes_pagination(monkeypatch):
-    class FakeFastMCP:
-        def __init__(self, name):
+    class FakeMCPServer:
+        def __init__(self, name, version=""):
             self.name = name
             self.tools = {}
 
@@ -852,15 +852,15 @@ def test_mcp_metadata_records_exposes_pagination(monkeypatch):
 
             return decorator
 
-    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
-    fake_fastmcp.FastMCP = FakeFastMCP
+    fake_mcpserver = types.ModuleType("mcp.server.mcpserver")
+    fake_mcpserver.MCPServer = FakeMCPServer
     fake_server = types.ModuleType("mcp.server")
-    fake_server.fastmcp = fake_fastmcp
+    fake_server.mcpserver = fake_mcpserver
     fake_mcp = types.ModuleType("mcp")
     fake_mcp.server = fake_server
     monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
     monkeypatch.setitem(sys.modules, "mcp.server", fake_server)
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
+    monkeypatch.setitem(sys.modules, "mcp.server.mcpserver", fake_mcpserver)
 
     from seafile_vault_cli.mcp_server import build_server
 
@@ -871,8 +871,8 @@ def test_mcp_metadata_records_exposes_pagination(monkeypatch):
 
 
 def test_mcp_search_uses_existing_safe_results(monkeypatch):
-    class FakeFastMCP:
-        def __init__(self, name):
+    class FakeMCPServer:
+        def __init__(self, name, version=""):
             self.name = name
             self.tools = {}
 
@@ -883,15 +883,15 @@ def test_mcp_search_uses_existing_safe_results(monkeypatch):
 
             return decorator
 
-    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
-    fake_fastmcp.FastMCP = FakeFastMCP
+    fake_mcpserver = types.ModuleType("mcp.server.mcpserver")
+    fake_mcpserver.MCPServer = FakeMCPServer
     fake_server = types.ModuleType("mcp.server")
-    fake_server.fastmcp = fake_fastmcp
+    fake_server.mcpserver = fake_mcpserver
     fake_mcp = types.ModuleType("mcp")
     fake_mcp.server = fake_server
     monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
     monkeypatch.setitem(sys.modules, "mcp.server", fake_server)
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
+    monkeypatch.setitem(sys.modules, "mcp.server.mcpserver", fake_mcpserver)
 
     import seafile_vault_cli.mcp_server as mcp_server
 
@@ -914,3 +914,19 @@ def test_mcp_search_uses_existing_safe_results(monkeypatch):
     server = mcp_server.build_server()
     result = server.tools["seafile_vault_search_by_name"]("/docs", "*.md", "file", 10, False)
     assert result["results"] == [{"path": "/docs/note.md", "name": "note.md", "type": "file", "size": 1}]
+
+
+def test_mcp_server_builds_with_installed_sdk():
+    pytest.importorskip("mcp.server.mcpserver")
+    import asyncio
+
+    from seafile_vault_cli import __version__
+    from seafile_vault_cli.mcp_server import build_server
+
+    server = build_server()
+    assert server.name == "seafile-vault-cli"
+    assert server.version == __version__
+    names = {tool.name for tool in asyncio.run(server.list_tools())}
+    assert "seafile_vault_search_by_name" in names
+    assert "seafile_vault_metadata_records" in names
+    assert "seafile_vault_delete_path" not in names

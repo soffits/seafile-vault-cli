@@ -4,6 +4,7 @@ import json
 import sys
 from typing import Any
 
+from . import __version__
 from .cli import EXIT_CONFIG, SEARCH_DEFAULT_MAX_RESULTS, SEARCH_HARD_MAX_RESULTS, _search_results
 from .client import SeafileVaultClient
 
@@ -14,11 +15,11 @@ def _client() -> SeafileVaultClient:
 
 def build_server() -> Any:
     try:
-        from mcp.server.fastmcp import FastMCP
+        from mcp.server.mcpserver import MCPServer
     except Exception as exc:  # pragma: no cover - depends on optional extra
         raise RuntimeError("mcp package is required: install seafile-vault-cli[mcp]") from exc
 
-    mcp = FastMCP("seafile-vault-cli")
+    mcp = MCPServer("seafile-vault-cli", version=__version__)
 
     @mcp.tool()
     def seafile_vault_repo_info() -> dict[str, Any]:
