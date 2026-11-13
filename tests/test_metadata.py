@@ -159,8 +159,8 @@ def test_cli_metadata_json_stdin_confirmation_and_trailing_data(monkeypatch, cap
 
 
 def test_mcp_registers_read_only_metadata_and_no_mutations(monkeypatch):
-    class FakeFastMCP:
-        def __init__(self, name):
+    class FakeMCPServer:
+        def __init__(self, name, version=""):
             self.name = name
             self.tools = {}
 
@@ -171,15 +171,15 @@ def test_mcp_registers_read_only_metadata_and_no_mutations(monkeypatch):
 
             return decorator
 
-    fake_fastmcp = types.ModuleType("mcp.server.fastmcp")
-    fake_fastmcp.FastMCP = FakeFastMCP
+    fake_mcpserver = types.ModuleType("mcp.server.mcpserver")
+    fake_mcpserver.MCPServer = FakeMCPServer
     fake_server = types.ModuleType("mcp.server")
-    fake_server.fastmcp = fake_fastmcp
+    fake_server.mcpserver = fake_mcpserver
     fake_mcp = types.ModuleType("mcp")
     fake_mcp.server = fake_server
     monkeypatch.setitem(sys.modules, "mcp", fake_mcp)
     monkeypatch.setitem(sys.modules, "mcp.server", fake_server)
-    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake_fastmcp)
+    monkeypatch.setitem(sys.modules, "mcp.server.mcpserver", fake_mcpserver)
 
     import seafile_vault_cli.mcp_server as mcp_server
 
