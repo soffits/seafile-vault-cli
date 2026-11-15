@@ -1,28 +1,18 @@
 # Seafile Vault CLI
 
-Seafile Vault CLI is a secure, non-interactive command line tool for one Seafile library scoped by one repo token. It is built for agent and automation runtimes that need deterministic JSON, narrow permissions, explicit paths, and no interactive prompts.
+A CLI client that works with a single [Seafile](https://www.seafile.com/) library. You hand it a repo token (Seafile ties that token to one library), and it can list, search, read, download, and upload files in that library; it also covers shares, locks, metadata, and history. Each command prints a single JSON line and never prompts, which makes it a good fit for terminals, scripts, scheduled jobs, and AI agents. There's also an optional MCP server that exposes the read-only side as tools.
 
-The CLI is the primary interface. The optional MCP server exposes read-only tools for runtimes that can use MCP.
+## Safety
 
-## Architecture And Security
+The tool is built on the idea that whoever uses it can't exceed the token's limits, and by default can do less.
 
-- `src/seafile_vault_cli/client.py` owns Seafile protocol behavior and security checks.
-- `src/seafile_vault_cli/cli.py` owns command dispatch and JSON success/error envelopes.
-- `src/seafile_vault_cli/metadata.py` owns grouped metadata commands and bounded JSON stdin parsing.
-- `src/seafile_vault_cli/mcp_server.py` exposes read-only MCP tools only.
-- `src/seafile_vault_cli/lock_registry.py` tracks durable local lock state without storing secrets.
-
-Security boundaries:
-
-- `SEAFILE_REPO_TOKEN` is required and must scope exactly one library. Tokens are read from environment variables only, never argv.
-- `SEAFILE_PERMISSION_MODE` defaults to `read_only`; write operations require `read_write` and mutation-specific confirmation where applicable.
-- `SEAFILE_ACCOUNT_TOKEN` is optional and used only for account-token capabilities: history, current-library public share lifecycle, and thumbnail fetches.
-- Repo and account authorization headers are isolated. Repo-token calls use `Bearer`; account-token calls use `Token`.
-- Remote paths must be absolute normalized POSIX paths. Relative paths, `.`, `..`, duplicate slashes, ASCII control characters, unsafe root operations, and unsafe returned links are rejected.
-- Download and upload links are same-origin validated. Token-bearing upload/download URLs, authorization headers, repo tokens, account tokens, raw revoke tokens, and passwords are redacted from errors and sanitized results.
-- Agent-facing list/search/metadata outputs strip repo IDs, owner emails, modifier emails, lock owners, tokens, passwords, and other unnecessary internals while keeping required view/tag/record IDs.
-- Thumbnail download never falls back to the original file. Missing or invalid thumbnail routes fail explicitly.
-- Tests must not contact live Seafile or GitHub.
+- `SEAFILE_REPO_TOKEN` is required and maps to one library only. Environment variables are the sole source of tokens; command-line arguments never supply them.
+- `SEAFILE_PERMISSION_MODE` starts at `read_only`. To write, you need `read_write`, and certain writes also require a confirmation flag you set explicitly.
+- `SEAFILE_ACCOUNT_TOKEN` is optional; it comes into play only for thumbnails, for sharing whichever library is current, and for history. The repo token and account token travel in separate headers and are never combined.
+- Any remote path must be a POSIX path that is absolute and normalized. The tool rejects `.`, `..`, relative paths, doubled slashes, control characters, and dangerous actions on the library root; it also rejects links from the server that point somewhere unexpected.
+- Links for downloads and uploads have to share the server's origin. Errors and results get scrubbed of passwords, authorization headers, tokens, and URLs that carry tokens.
+- Output drops repo ids, emails for owners and modifiers, lock holders, and other internals no caller needs; it keeps the ids for views, tags, and records that later commands accept.
+- When someone requests a thumbnail, the tool never downloads the original file as a fallback.
 
 ## Installation
 
@@ -89,7 +79,7 @@ seafile-library docs metadata views list
 
 A profile named `docs` maps only to `docs.env`. Profile files are strict UTF-8 `KEY=VALUE` files, without shell evaluation. The launcher rejects traversal, control characters, symlinks, unsupported keys, duplicate keys, malformed lines, NUL bytes, insecure directory permissions, and env files readable or writable by group/other users. Supported Seafile keys are `SEAFILE_SERVER_URL`, `SEAFILE_REPO_TOKEN`, `SEAFILE_ACCOUNT_TOKEN`, `SEAFILE_PERMISSION_MODE`, size/time limits, chunk settings, and direct-origin upload IP.
 
-## Core Commands
+## Commands
 
 Read-only examples:
 
@@ -146,7 +136,7 @@ Use `locks --prune` only after a `locks` audit proves records are stale because 
 
 Normal `unlock` refuses paths absent from the local registry so it cannot silently release a lock created by another client. If the registry was genuinely lost, first verify the exact path and lock ownership, then use the explicit recovery form `unlock PATH --force-untracked --confirm`.
 
-## History, Restore, Shares, And Thumbnails
+## History, restore, shares and thumbnails
 
 History requires `SEAFILE_ACCOUNT_TOKEN`:
 
@@ -213,7 +203,7 @@ If metadata or tags are disabled for the library, commands return a structured `
 
 `seafile-vault-mcp` exposes safe read tools only: repo info, directory list, recursive name search, UTF-8 text read, same-origin download link, library/file history, current-library share list, metadata views list/get, metadata records list, metadata tags status/list, and tag files. It does not expose share creation/revocation, restore, lock/unlock, uploads, writes, deletes, moves, renames, or metadata mutations.
 
-## JSON Contract
+## JSON output
 
 Successful commands write one compact JSON object to stdout:
 
@@ -230,6 +220,8 @@ Errors write one compact JSON object to stderr:
 Exit codes are stable: `0` success, `2` usage, `3` configuration or unsupported capability, `4` permission mode, `5` path/link/local input security, and `6` Seafile/remote/size/local lock failures.
 
 ## Development
+
+Where things live: `client.py` has the Seafile protocol and the security checks, `cli.py` command dispatch and the JSON envelopes, `metadata.py` the metadata commands and bounded JSON stdin parsing, `mcp_server.py` the read-only MCP tools, and `lock_registry.py` local lock state (no secrets), all under `src/seafile_vault_cli/`. Tests never contact a live Seafile server or GitHub.
 
 ```bash
 uv sync --extra dev --extra mcp
