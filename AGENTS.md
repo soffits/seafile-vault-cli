@@ -7,3 +7,7 @@ Use `uv run ruff check src tests pyproject.toml` for linting and `uv run pytest`
 Security boundaries: never persist repo tokens, account tokens, authorization headers, upload/download links, raw share revoke tokens, passwords, or live Seafile secrets. Do not contact live Seafile or GitHub from tests. Preserve path validation, same-origin link validation, read-only mode, metadata capability mapping, thumbnail no-fallback behavior, and redaction rules. MCP must remain read-only.
 
 Repository text must be English only. Do not include assistant provenance, private persona mechanics, generated-by notes, or hidden process descriptions. Commit messages, when requested, use Conventional Commits. The project license is AGPL-3.0-only.
+
+## Git
+
+- PR titles are Conventional Commit subjects (`feat: ...`, `fix(scope): ...`), because a squash merge makes the title the commit on the default branch; CI checks it.
