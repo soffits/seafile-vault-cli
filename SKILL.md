@@ -3,7 +3,7 @@ name: seafile-vault-cli
 description: Use when operating one token-scoped Seafile library through Seafile Vault CLI or its optional read-only MCP server.
 version: 0.4.1
 author: Sakina
-license: AGPL-3.0
+license: AGPL-3.0-or-later
 metadata:
   hermes:
     tags:
