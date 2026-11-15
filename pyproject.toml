@@ -7,7 +7,7 @@ name = "seafile-vault-cli"
 version = "0.4.1"
 description = "Secure, non-interactive CLI for one token-scoped Seafile library"
 readme = "README.md"
-license = "AGPL-3.0-only"
+license = "AGPL-3.0-or-later"
 authors = [{ name = "Sakina" }]
 maintainers = [{ name = "Sakina" }]
 requires-python = ">=3.11"
@@ -17,7 +17,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

@@ -229,3 +229,7 @@ uv run ruff check src tests pyproject.toml
 uv run pytest
 uv build
 ```
+
+## License
+
+Copyright © 2026 Sakina. Licensed under the [GNU Affero General Public License v3.0 or later](LICENSE).
