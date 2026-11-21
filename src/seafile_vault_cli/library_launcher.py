@@ -18,7 +18,8 @@ EXIT_CONFIG = 3
 DEFAULT_CONFIG_DIR = "~/.config/seafile-vault/libraries"
 PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*")
-REQUIRED_KEYS = {"SEAFILE_SERVER_URL", "SEAFILE_REPO_TOKEN"}
+REQUIRED_KEYS = {"SEAFILE_SERVER_URL"}
+LIBRARY_KEYS = {"SEAFILE_REPO_TOKEN", "SEAFILE_REPO_ID"}
 OPTIONAL_KEYS = {
     "SEAFILE_ACCOUNT_TOKEN",
     "SEAFILE_ACCOUNT_TOKEN_FILE",
@@ -31,7 +32,7 @@ OPTIONAL_KEYS = {
     "SEAFILE_UPLOAD_CHUNK_SIZE",
     "SEAFILE_UPLOAD_DIRECT_IP",
 }
-ALLOWED_KEYS = REQUIRED_KEYS | OPTIONAL_KEYS
+ALLOWED_KEYS = REQUIRED_KEYS | LIBRARY_KEYS | OPTIONAL_KEYS
 
 
 def _success(data: Any) -> dict[str, Any]:
@@ -181,6 +182,8 @@ def _read_profile_file(path: Path) -> dict[str, str]:
     missing = sorted(REQUIRED_KEYS - values.keys())
     if missing:
         raise LauncherError("configuration", f"library profile is missing required keys: {', '.join(missing)}")
+    if not LIBRARY_KEYS & values.keys():
+        raise LauncherError("configuration", "library profile is missing required keys: SEAFILE_REPO_TOKEN or SEAFILE_REPO_ID")
     return values
 
 

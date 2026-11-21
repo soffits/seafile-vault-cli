@@ -1,14 +1,14 @@
 # Seafile Vault CLI
 
-A CLI client that works with a single [Seafile](https://www.seafile.com/) library. You hand it a repo token (Seafile ties that token to one library), and it can list, search, read, download, and upload files in that library; it also covers shares, locks, metadata, and history. Each command prints a single JSON line and never prompts, which makes it a good fit for terminals, scripts, scheduled jobs, and AI agents. There's also an optional MCP server that exposes the read-only side as tools.
+A CLI client that works with a single [Seafile](https://www.seafile.com/) library. You hand it a repo token (Seafile ties that token to one library), or an account token plus the library id, and it can list, search, read, download, and upload files in that library; it also covers shares, locks, metadata, and history. Each command prints a single JSON line and never prompts, which makes it a good fit for terminals, scripts, scheduled jobs, and AI agents. There's also an optional MCP server that exposes the read-only side as tools.
 
 ## Safety
 
 The tool is built on the idea that whoever uses it can't exceed the token's limits, and by default can do less.
 
-- `SEAFILE_REPO_TOKEN` is required and maps to one library only. Environment variables are the sole source of tokens; command-line arguments never supply them.
+- A library is named by `SEAFILE_REPO_TOKEN` (one library only) or by `SEAFILE_REPO_ID` together with an account token; exactly one of the two. Environment variables are the sole source of tokens; command-line arguments never supply them.
 - `SEAFILE_PERMISSION_MODE` starts at `read_only`. To write, you need `read_write`, and certain writes also require a confirmation flag you set explicitly.
-- `SEAFILE_ACCOUNT_TOKEN` is optional; it comes into play only for thumbnails, for sharing whichever library is current, and for history. Instead of the value, `SEAFILE_ACCOUNT_TOKEN_FILE` can name a file holding it (set only one of the two). The repo token and account token travel in separate headers and are never combined.
+- With a repo token, `SEAFILE_ACCOUNT_TOKEN` is optional; it comes into play only for thumbnails, for sharing whichever library is current, and for history. In account mode it is the credential for everything, and the commands can reach only the one library named by `SEAFILE_REPO_ID`. Instead of the value, `SEAFILE_ACCOUNT_TOKEN_FILE` can name a file holding it (set only one of the two). The repo token and account token travel in separate headers and are never combined.
 - Any remote path must be a POSIX path that is absolute and normalized. The tool rejects `.`, `..`, relative paths, doubled slashes, control characters, and dangerous actions on the library root; it also rejects links from the server that point somewhere unexpected.
 - Links for downloads and uploads have to share the server's origin. Errors and results get scrubbed of passwords, authorization headers, tokens, and URLs that carry tokens.
 - Output drops repo ids, emails for owners and modifiers, lock holders, and other internals no caller needs; it keeps the ids for views, tags, and records that later commands accept.
@@ -41,13 +41,24 @@ uv run seafile-vault-mcp
 
 ## Configuration
 
-Required:
+Required, with a repo token:
 
 ```bash
 export SEAFILE_SERVER_URL="https://seafile.example.com"
 export SEAFILE_REPO_TOKEN="repo-token-for-one-library"
 export SEAFILE_PERMISSION_MODE="read_only"
 ```
+
+Or, in account mode, a library the account can already see (owned, or shared to it directly or through a group):
+
+```bash
+export SEAFILE_SERVER_URL="https://seafile.example.com"
+export SEAFILE_REPO_ID="library-uuid-from-GET-/api2/repos/"
+export SEAFILE_ACCOUNT_TOKEN_FILE="$HOME/.config/seafile/account-token"
+export SEAFILE_PERMISSION_MODE="read_only"
+```
+
+Account mode talks to Seafile's regular user API (`/api/v2.1/repos/<id>/...`, `/api2/repos/<id>/...`) instead of `/api/v2.1/via-repo-token/`. Commands, JSON output, permission mode, size limits, path checks, chunked upload, and hash checks are the same. Differences: directory times are reported in UTC, moving a directory renames on a name clash instead of merging, and resumable upload probing works (`resume_supported`). The permissions are the account's own, so the server may allow more than a repo token would; keep `SEAFILE_PERMISSION_MODE=read_only` unless you are writing. Setting both `SEAFILE_REPO_TOKEN` and `SEAFILE_REPO_ID` is a configuration error.
 
 Optional:
 
@@ -77,7 +88,7 @@ seafile-library docs search / --name '*.md'
 seafile-library docs metadata views list
 ```
 
-A profile named `docs` maps only to `docs.env`. Profile files are strict UTF-8 `KEY=VALUE` files, without shell evaluation. The launcher rejects traversal, control characters, symlinks, unsupported keys, duplicate keys, malformed lines, NUL bytes, insecure directory permissions, and env files readable or writable by group/other users. Supported Seafile keys are `SEAFILE_SERVER_URL`, `SEAFILE_REPO_TOKEN`, `SEAFILE_ACCOUNT_TOKEN`, `SEAFILE_ACCOUNT_TOKEN_FILE`, `SEAFILE_PERMISSION_MODE`, size/time limits, chunk settings, and direct-origin upload IP.
+A profile named `docs` maps only to `docs.env`. Profile files are strict UTF-8 `KEY=VALUE` files, without shell evaluation. The launcher rejects traversal, control characters, symlinks, unsupported keys, duplicate keys, malformed lines, NUL bytes, insecure directory permissions, and env files readable or writable by group/other users. Supported Seafile keys are `SEAFILE_SERVER_URL`, `SEAFILE_REPO_TOKEN`, `SEAFILE_REPO_ID`, `SEAFILE_ACCOUNT_TOKEN`, `SEAFILE_ACCOUNT_TOKEN_FILE`, `SEAFILE_PERMISSION_MODE`, size/time limits, chunk settings, and direct-origin upload IP.
 
 ## Commands
 
@@ -138,7 +149,7 @@ Normal `unlock` refuses paths absent from the local registry so it cannot silent
 
 ## History, restore, shares and thumbnails
 
-History requires `SEAFILE_ACCOUNT_TOKEN`:
+History requires an account token (`SEAFILE_ACCOUNT_TOKEN`, or account mode):
 
 ```bash
 seafile-vault history library --page 1 --per-page 100
@@ -221,7 +232,7 @@ Exit codes are stable: `0` success, `2` usage, `3` configuration or unsupported 
 
 ## Development
 
-Where things live: `client.py` has the Seafile protocol and the security checks, `cli.py` command dispatch and the JSON envelopes, `metadata.py` the metadata commands and bounded JSON stdin parsing, `mcp_server.py` the read-only MCP tools, and `lock_registry.py` local lock state (no secrets), all under `src/seafile_vault_cli/`. Tests never contact a live Seafile server or GitHub.
+Where things live: `client.py` has the Seafile protocol and the security checks, `backend.py` the two API dialects (repo token and account token), `cli.py` command dispatch and the JSON envelopes, `metadata.py` the metadata commands and bounded JSON stdin parsing, `mcp_server.py` the read-only MCP tools, and `lock_registry.py` local lock state (no secrets), all under `src/seafile_vault_cli/`. Tests never contact a live Seafile server or GitHub.
 
 ```bash
 uv sync --extra dev --extra mcp

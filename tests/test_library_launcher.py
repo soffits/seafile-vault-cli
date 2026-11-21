@@ -216,6 +216,20 @@ def test_library_launcher_env_parser_rejects_duplicates_malformed_keys_nul_and_m
     assert "NUL" in json.loads(capsys.readouterr().err)["error"]["message"]
 
 
+def test_library_launcher_accepts_repo_id_profile_and_still_requires_a_library_key(tmp_path, monkeypatch, capsys):
+    from seafile_vault_cli import library_launcher
+
+    config_dir = tmp_path / "libraries"
+    config_dir.mkdir(mode=0o700)
+    monkeypatch.setenv("SEAFILE_LIBRARY_CONFIG_DIR", str(config_dir))
+    server = "SEAFILE_SERVER_URL=https://seafile.example.com\n"
+    _write_profile(config_dir / "acct.env", server + "SEAFILE_REPO_ID=11111111-2222-3333-4444-555555555555\n")
+    assert library_launcher._read_profile_file(config_dir / "acct.env")["SEAFILE_REPO_ID"].startswith("11111111")
+    _write_profile(config_dir / "bare.env", server)
+    assert library_launcher.main(["bare", "repo-info"]) == 3
+    assert "SEAFILE_REPO_TOKEN or SEAFILE_REPO_ID" in json.loads(capsys.readouterr().err)["error"]["message"]
+
+
 def test_library_launcher_rejects_path_traversal_and_control_chars(capsys):
     from seafile_vault_cli import library_launcher
 
