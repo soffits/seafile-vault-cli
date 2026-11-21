@@ -19,7 +19,7 @@ metadata:
 
 ## Purpose
 
-Use this skill for one configured Seafile library scoped by `SEAFILE_REPO_TOKEN`. The CLI is deterministic JSON-first automation for listing, searching, reading, downloading, uploading, locking, history/share/thumbnail workflows, and Seafile v13 metadata views/records/tags.
+Use this skill for one configured Seafile library scoped by `SEAFILE_REPO_TOKEN`, or by `SEAFILE_REPO_ID` plus an account token (account mode: same commands through the regular user API). The CLI is deterministic JSON-first automation for listing, searching, reading, downloading, uploading, locking, history/share/thumbnail workflows, and Seafile v13 metadata views/records/tags.
 
 The MCP server is read-only. Use the CLI for any mutation.
 
@@ -87,6 +87,13 @@ Required environment:
 export SEAFILE_SERVER_URL="https://seafile.example.com"
 export SEAFILE_REPO_TOKEN="repo-token-for-one-library"
 export SEAFILE_PERMISSION_MODE="read_only"
+```
+
+Or use account mode instead of the repo token (set exactly one of `SEAFILE_REPO_TOKEN`, `SEAFILE_REPO_ID`):
+
+```bash
+export SEAFILE_REPO_ID="library-uuid"
+export SEAFILE_ACCOUNT_TOKEN_FILE="$HOME/.config/seafile/account-token"
 ```
 
 Optional account token, only for history/share lifecycle/thumbnail fetch:

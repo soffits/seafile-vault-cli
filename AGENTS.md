@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This repository builds a secure, non-interactive Python CLI and optional MCP server for one token-scoped Seafile library. Core Seafile behavior belongs in `src/seafile_vault_cli/client.py`; command parsing and JSON envelopes belong in `src/seafile_vault_cli/cli.py`; grouped metadata command parsing and bounded JSON stdin belong in `src/seafile_vault_cli/metadata.py`; MCP wrappers belong in `src/seafile_vault_cli/mcp_server.py`; durable local lock state belongs in the lock registry module.
+This repository builds a secure, non-interactive Python CLI and optional MCP server for one Seafile library, reached with a repo token or with an account token plus library id. Core Seafile behavior belongs in `src/seafile_vault_cli/client.py`; the differences between the repo-token API and the regular user API (routes, parameter names, bodies) belong in `backend.py`; command parsing and JSON envelopes belong in `src/seafile_vault_cli/cli.py`; grouped metadata command parsing and bounded JSON stdin belong in `src/seafile_vault_cli/metadata.py`; MCP wrappers belong in `src/seafile_vault_cli/mcp_server.py`; durable local lock state belongs in the lock registry module.
 
 Use `uv run ruff check src tests pyproject.toml` for linting and `uv run pytest` for tests. Keep changes typed, focused, and consistent with the existing JSON error model. Prefer stdlib facilities unless a dependency is clearly necessary.
 

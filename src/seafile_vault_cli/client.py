@@ -18,6 +18,7 @@ from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
+from .backend import AccountTokenBackend, Backend, RepoTokenBackend
 from .lock_policy import validate_lock_expiry_seconds
 
 DEFAULT_MAX_READ_SIZE = 1024 * 1024
@@ -468,7 +469,7 @@ def _account_token_from_env() -> str | None:
 @dataclass(frozen=True)
 class Config:
     server_url: str
-    repo_token: str
+    repo_token: str | None = None
     account_token: str | None = None
     permission_mode: PermissionMode = PermissionMode.READ_ONLY
     max_read_size: int = DEFAULT_MAX_READ_SIZE
@@ -478,22 +479,29 @@ class Config:
     upload_chunk_size: int = DEFAULT_UPLOAD_CHUNK_SIZE
     upload_direct_ip: str | None = None
     max_download_size: int | None = DEFAULT_MAX_DOWNLOAD_SIZE
+    repo_id: str | None = None
 
     @classmethod
     def from_env(cls) -> Config:
         server_url = os.environ.get("SEAFILE_SERVER_URL") or ""
-        repo_token = os.environ.get("SEAFILE_REPO_TOKEN") or ""
+        repo_token = os.environ.get("SEAFILE_REPO_TOKEN") or None
+        repo_id = os.environ.get("SEAFILE_REPO_ID") or None
         account_token = _account_token_from_env()
         if not server_url.strip():
             raise ConfigError("SEAFILE_SERVER_URL is required")
-        if not repo_token:
-            raise ConfigError("SEAFILE_REPO_TOKEN is required")
         if account_token is not None and not account_token.strip():
             raise ConfigError("SEAFILE_ACCOUNT_TOKEN and SEAFILE_ACCOUNT_TOKEN_FILE must be non-empty when set")
+        if repo_token and repo_id:
+            raise ConfigError("set SEAFILE_REPO_TOKEN or SEAFILE_REPO_ID, not both")
+        if not repo_token and not repo_id:
+            raise ConfigError("SEAFILE_REPO_TOKEN, or SEAFILE_REPO_ID with an account token, is required")
+        if repo_id and account_token is None:
+            raise ConfigError("SEAFILE_REPO_ID requires SEAFILE_ACCOUNT_TOKEN or SEAFILE_ACCOUNT_TOKEN_FILE")
         return cls(
             server_url=_validated_server_url(server_url),
             repo_token=repo_token,
             account_token=account_token,
+            repo_id=repo_id,
             permission_mode=_parse_permission_mode(os.environ.get("SEAFILE_PERMISSION_MODE")),
             max_download_size=_parse_optional_int_env("SEAFILE_MAX_DOWNLOAD_SIZE", DEFAULT_MAX_DOWNLOAD_SIZE),
             max_read_size=_parse_int_env("SEAFILE_MAX_READ_SIZE", DEFAULT_MAX_READ_SIZE),
@@ -506,14 +514,15 @@ class Config:
 
 
 class SeafileVaultClient:
-    """Repo-token-only Seafile client using /api/v2.1/via-repo-token endpoints."""
+    """Client for one Seafile library, through a repo token or through an account token plus library id."""
 
     def __init__(
         self,
         server_url: str,
-        repo_token: str,
+        repo_token: str | None = None,
         *,
         account_token: str | None = None,
+        repo_id: str | None = None,
         permission_mode: PermissionMode | str = PermissionMode.READ_ONLY,
         max_download_size: int | None = DEFAULT_MAX_DOWNLOAD_SIZE,
         max_read_size: int = DEFAULT_MAX_READ_SIZE,
@@ -525,12 +534,23 @@ class SeafileVaultClient:
         http_client: httpx.Client | None = None,
     ) -> None:
         self.server_url = _validated_server_url(server_url)
-        if not isinstance(repo_token, str) or not repo_token.strip():
-            raise ConfigError("repo_token must be a non-empty string")
+        if repo_token is not None and (not isinstance(repo_token, str) or not repo_token.strip()):
+            raise ConfigError("repo_token must be a non-empty string when set")
         if account_token is not None and (not isinstance(account_token, str) or not account_token.strip()):
             raise ConfigError("account_token must be a non-empty string when set")
         self.repo_token = repo_token
         self.account_token = account_token
+        self.backend: Backend
+        if repo_token is not None:
+            if repo_id is not None:
+                raise ConfigError("set a repo token or a repo id, not both")
+            self.backend = RepoTokenBackend(self.server_url, repo_token)
+        else:
+            if repo_id is None or account_token is None:
+                raise ConfigError("a repo token, or a repo id with an account token, is required")
+            if not isinstance(repo_id, str) or not _REPO_ID_RE.fullmatch(repo_id):
+                raise ConfigError("repo_id must be a library UUID")
+            self.backend = AccountTokenBackend(self.server_url, account_token, repo_id)
         self.permission_mode = _parse_permission_mode(str(permission_mode))
         self.max_download_size = None if max_download_size is None else _validate_positive_int("max_download_size", max_download_size)
         self.max_read_size = _validate_positive_int("max_read_size", max_read_size)
@@ -549,6 +569,7 @@ class SeafileVaultClient:
             cfg.server_url,
             cfg.repo_token,
             account_token=cfg.account_token,
+            repo_id=cfg.repo_id,
             permission_mode=cfg.permission_mode,
             max_download_size=cfg.max_download_size,
             max_read_size=cfg.max_read_size,
@@ -596,14 +617,17 @@ class SeafileVaultClient:
         return normalized
 
     def _url(self, suffix: str) -> str:
-        return f"{self.server_url}/api/v2.1/via-repo-token/{suffix.lstrip('/')}"
+        return self.backend.url(suffix)
+
+    def _path_params(self, path: str, **extra: str) -> dict[str, str]:
+        return {self.backend.path_key: path, **extra}
 
     def _api_url(self, suffix: str) -> str:
         return f"{self.server_url}/api/v2.1/{suffix.lstrip('/')}"
 
     @property
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.repo_token}", "Accept": "application/json"}
+        return self.backend.headers
 
     @property
     def _account_headers(self) -> dict[str, str]:
@@ -645,7 +669,7 @@ class SeafileVaultClient:
                 return "metadata tags are disabled for this library; enable tags before using tag operations"
             return "metadata is disabled for this library; enable Seafile metadata before using metadata operations"
         if response.status_code == 405:
-            return "this Seafile deployment does not expose the requested repo-token metadata capability"
+            return "this Seafile deployment does not expose the requested metadata capability"
         return None
 
     def _metadata_request(self, method: str, suffix: str, **kwargs: Any) -> httpx.Response:
@@ -693,9 +717,11 @@ class SeafileVaultClient:
             raise SeafileVaultError(self._redact(message, *secrets_to_redact)) from None
 
     def get_repo_info(self) -> dict[str, Any]:
-        return self._request("GET", "repo-info/").json()
+        return self.backend.normalize_repo_info(self._request("GET", "repo-info/").json())
 
     def _repo_id(self) -> str:
+        if isinstance(self.backend, AccountTokenBackend):
+            return self.backend.repo_id
         repo_info = self.get_repo_info()
         repo_id = repo_info.get("repo_id") if isinstance(repo_info, dict) else None
         if not isinstance(repo_id, str) or not _REPO_ID_RE.fullmatch(repo_id):
@@ -734,7 +760,7 @@ class SeafileVaultClient:
         path = self._validate_non_root_path(path, "restore")
         commit_id = validate_commit_id(commit_id)
         endpoint = "dir/" if is_directory else "file/"
-        response = self._request("POST", endpoint, params={"path": path}, json={"operation": "revert", "commit_id": commit_id})
+        response = self._request("POST", endpoint, params=self._path_params(path), json={"operation": "revert", "commit_id": commit_id})
         return {
             "path": path,
             "type": "dir" if is_directory else "file",
@@ -1012,9 +1038,9 @@ class SeafileVaultClient:
     def _get_remote_file_info(self, path: str) -> dict[str, Any] | None:
         url = self._url("file/")
         try:
-            response = self.http.get(url, headers=self._headers, params={"path": path}, timeout=self.upload_timeout)
+            response = self.http.get(url, headers=self._headers, params=self._path_params(path), timeout=self.upload_timeout)
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(str(exc), url)) from None
         if response.status_code == 404:
             return None
         try:
@@ -1022,7 +1048,7 @@ class SeafileVaultClient:
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:1000] if exc.response is not None else ""
             status = exc.response.status_code if exc.response else "error"
-            raise SeafileVaultError(redact_secret(f"Seafile file-info HTTP {status}: {body}", self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(f"Seafile file-info HTTP {status}: {body}", url)) from None
         try:
             data = response.json()
         except ValueError as exc:
@@ -1043,9 +1069,9 @@ class SeafileVaultClient:
 
     def _parse_operation_response(self, response: httpx.Response, *secrets_to_redact: str | None) -> Any:
         try:
-            return _sanitize_upload_value(response.json(), self.repo_token, *secrets_to_redact)
+            return _sanitize_upload_value(response.json(), self.repo_token, self.account_token, *secrets_to_redact)
         except ValueError:
-            return {"response_text": redact_secret(response.text[:1000], self.repo_token, *secrets_to_redact)}
+            return {"response_text": self._redact(response.text[:1000], *secrets_to_redact)}
 
     def _verify_remote_file_size(self, path: str, expected_size: int, *, allow_missing: bool = False) -> dict[str, Any] | None:
         info = self._get_remote_file_info(path)
@@ -1082,7 +1108,7 @@ class SeafileVaultClient:
                 timeout=self.upload_timeout,
             )
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(str(exc), url)) from None
         if response.status_code in {401, 403, 404, 405, 501}:
             return None
         try:
@@ -1090,7 +1116,7 @@ class SeafileVaultClient:
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:1000] if exc.response is not None else ""
             status = exc.response.status_code if exc.response else "error"
-            raise SeafileVaultError(redact_secret(f"Seafile resume HTTP {status}: {body}", self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(f"Seafile resume HTTP {status}: {body}", url)) from None
         try:
             data = response.json()
         except ValueError as exc:
@@ -1112,18 +1138,18 @@ class SeafileVaultClient:
         thumbnail_size: int | None = None,
     ) -> Any:
         path = self.validate_vault_path(path)
-        params: dict[str, str] = {"path": path}
+        params: dict[str, str] = self._path_params(path)
         if recursive:
             params["recursive"] = "1"
         if type_filter:
             if type_filter not in {"f", "d"}:
                 raise ValueError("type_filter must be 'f' or 'd'")
-            params["type"] = type_filter
+            params[self.backend.type_key] = type_filter
         if with_thumbnail:
             params["with_thumbnail"] = "true"
             if thumbnail_size is not None:
                 params["thumbnail_size"] = str(validate_thumbnail_size(thumbnail_size))
-        return self._request("GET", "dir/", params=params).json()
+        return self.backend.normalize_listing(self._request("GET", "dir/", params=params).json())
 
     def _directory_entries(self, data: Any) -> list[dict[str, Any]]:
         entries = data.get("dirent_list") if isinstance(data, dict) else data
@@ -1154,7 +1180,7 @@ class SeafileVaultClient:
         return None
 
     def _create_directory_unchecked(self, path: str, name: str) -> Any:
-        result = self._request("POST", "dir/", params={"path": path}, json={"operation": "mkdir"}).json()
+        result = self._request("POST", "dir/", params=self._path_params(path), json={"operation": "mkdir"}).json()
         if not isinstance(result, dict):
             raise SeafileVaultError("directory create response was not an object")
         reported_name = result.get("obj_name")
@@ -1221,7 +1247,7 @@ class SeafileVaultClient:
         return self._request(
             "POST",
             endpoint,
-            params={"path": path},
+            params=self._path_params(path),
             json={"operation": "rename", "newname": new_name},
         ).json()
 
@@ -1230,21 +1256,13 @@ class SeafileVaultClient:
         path = self._validate_non_root_path(path, "move")
         destination_dir = self.validate_vault_path(destination_dir)
         if is_directory:
-            src_parent_dir, src_dirent_name = self._split_parent_name(path)
-            return self._request(
-                "POST",
-                "move-dir/",
-                json={
-                    "src_parent_dir": src_parent_dir,
-                    "src_dirent_name": src_dirent_name,
-                    "dst_parent_dir": destination_dir,
-                },
-            ).json()
+            route, body = self.backend.move_directory_request(*self._split_parent_name(path), destination_dir)
+            return self._request("POST", route, json=body).json()
         return self._request(
             "POST",
             "file/",
-            params={"path": path},
-            json={"operation": "move", "dst_dir": destination_dir},
+            params=self._path_params(path),
+            json=self.backend.file_transfer_body("move", destination_dir),
         ).json()
 
     def _normalize_file_operation_metadata(self, source_path: str, destination_dir: str, data: Any) -> dict[str, Any]:
@@ -1265,8 +1283,8 @@ class SeafileVaultClient:
         response = self._request(
             "POST",
             "file/",
-            params={"path": source_path},
-            json={"operation": "copy", "dst_dir": destination_dir},
+            params=self._path_params(source_path),
+            json=self.backend.file_transfer_body("copy", destination_dir),
         )
         return self._normalize_file_operation_metadata(source_path, destination_dir, response.json())
 
@@ -1279,15 +1297,8 @@ class SeafileVaultClient:
             raise PathSecurityError("directory copy destination must differ from the source parent directory")
         if destination_dir == source_path or destination_dir.startswith(f"{source_path}/"):
             raise PathSecurityError("cannot copy a directory into itself or one of its descendants")
-        response = self._request(
-            "POST",
-            "sync-batch-copy-item/",
-            json={
-                "src_parent_dir": source_parent,
-                "src_dirents": [source_name],
-                "dst_parent_dir": destination_dir,
-            },
-        )
+        route, body = self.backend.copy_directory_request(source_parent, source_name, destination_dir)
+        response = self._request("POST", route, json=body)
         return {
             "source_path": source_path,
             "destination_directory": destination_dir,
@@ -1325,9 +1336,9 @@ class SeafileVaultClient:
     ) -> Any:
         url = self._url("file/")
         try:
-            response = self.http.put(url, headers=self._headers, params={"path": path}, json=payload)
+            response = self.http.put(url, headers=self._headers, params=self._path_params(path), json=payload)
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(str(exc), url)) from None
         if response.status_code == 404:
             raise RemoteNotFoundError(f"remote file not found: {path}")
         if detect_not_locked and response.status_code in {400, 409}:
@@ -1340,14 +1351,14 @@ class SeafileVaultClient:
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:1000] if exc.response is not None else ""
             status = exc.response.status_code if exc.response else "error"
-            raise SeafileVaultError(redact_secret(f"Seafile {context} HTTP {status}: {body}", self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(f"Seafile {context} HTTP {status}: {body}", url)) from None
         return self._parse_operation_response(response, url)
 
     def delete_path(self, path: str, *, recursive: bool = False) -> Any:
         self.require_read_write()
         path = self._validate_non_root_path(path, "delete")
         endpoint = "dir/" if recursive else "file/"
-        return self._request("DELETE", endpoint, params={"path": path}).json()
+        return self._request("DELETE", endpoint, params=self._path_params(path)).json()
 
     def get_download_link(self, path: str) -> str:
         path = self.validate_vault_path(path)
@@ -1355,9 +1366,9 @@ class SeafileVaultClient:
             raise PathSecurityError("download link requires a file path")
         url = self._url("download-link/")
         try:
-            response = self.http.get(url, headers=self._headers, params={"path": path})
+            response = self.http.get(url, headers=self._headers, params=self.backend.download_link_params(path))
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(str(exc), url)) from None
         if response.status_code == 404:
             raise RemoteNotFoundError(f"remote file not found: {path}")
         try:
@@ -1365,7 +1376,7 @@ class SeafileVaultClient:
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:1000] if exc.response is not None else ""
             status = exc.response.status_code if exc.response else "error"
-            raise SeafileVaultError(redact_secret(f"Seafile download-link HTTP {status}: {body}", self.repo_token, url)) from None
+            raise SeafileVaultError(self._redact(f"Seafile download-link HTTP {status}: {body}", url)) from None
         data = response.json()
         if not isinstance(data, str):
             raise SeafileVaultError("download-link response was not a string")
@@ -1481,7 +1492,7 @@ class SeafileVaultClient:
                 "overwrite": overwrite,
             }
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, link)) from None
+            raise SeafileVaultError(self._redact(str(exc), link)) from None
         except RemoteNotFoundError:
             raise
         except OSError as exc:
@@ -1663,7 +1674,7 @@ class SeafileVaultClient:
                     chunks.append(chunk)
                 return b"".join(chunks)
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, link)) from None
+            raise SeafileVaultError(self._redact(str(exc), link)) from None
 
     def read_file_base64(self, path: str) -> str:
         return base64.b64encode(self.read_file_bytes(path)).decode("ascii")
@@ -1682,7 +1693,7 @@ class SeafileVaultClient:
         return parent, name
 
     def _get_upload_link(self, parent_dir: str, *, overwrite: bool) -> str:
-        params = {"path": parent_dir, "replace": "1" if overwrite else "0"}
+        params = self.backend.upload_link_params(parent_dir, overwrite=overwrite)
         data = self._request("GET", "upload-link/", params=params).json()
         if not isinstance(data, str):
             raise SeafileVaultError("upload-link response was not a string")
@@ -1732,11 +1743,11 @@ class SeafileVaultClient:
             body = exc.response.text[:1000] if exc.response is not None else ""
             status = exc.response.status_code if exc.response else "error"
             msg = f"Seafile upload HTTP {status}: {body}"
-            raise SeafileVaultError(redact_secret(msg, self.repo_token, upload_link)) from None
+            raise SeafileVaultError(self._redact(msg, upload_link)) from None
         try:
-            return _sanitize_upload_value(response.json(), self.repo_token, upload_link)
+            return _sanitize_upload_value(response.json(), self.repo_token, self.account_token, upload_link)
         except ValueError:
-            return {"response_text": redact_secret(response.text[:1000], self.repo_token, upload_link)}
+            return {"response_text": self._redact(response.text[:1000], upload_link)}
 
     def _parse_chunk_response(self, response: httpx.Response, upload_link: str, *, final: bool) -> Any:
         data = self._parse_upload_response(response, upload_link)
@@ -1776,7 +1787,7 @@ class SeafileVaultClient:
             response = self.http.post(upload_link, data=form, files=files, timeout=self.upload_timeout)
             return self._parse_upload_response(response, upload_link)
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, upload_link)) from None
+            raise SeafileVaultError(self._redact(str(exc), upload_link)) from None
 
     def _open_local_upload_file(self, local_path: str | os.PathLike[str]) -> LocalUpload:
         path = Path(local_path)
@@ -1904,7 +1915,7 @@ class SeafileVaultClient:
             response = self.http.post(upload_link, content=stream, headers=headers, timeout=self.upload_timeout)
             return self._parse_upload_response(response, upload_link)
         except httpx.HTTPError as exc:
-            raise SeafileVaultError(redact_secret(str(exc), self.repo_token, upload_link)) from None
+            raise SeafileVaultError(self._redact(str(exc), upload_link)) from None
 
     def _upload_file_path_chunked(
         self,
@@ -1986,13 +1997,13 @@ class SeafileVaultClient:
                     if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500:
                         body = exc.response.text[:1000]
                         msg = f"Seafile upload HTTP {exc.response.status_code}: {body}"
-                        raise SeafileVaultError(redact_secret(msg, self.repo_token, upload_link)) from None
+                        raise SeafileVaultError(self._redact(msg, upload_link)) from None
                     last_exc = exc
                     if final:
                         try:
                             info = self._verify_remote_file_size(remote_path, local.size, allow_missing=True)
                         except SeafileVaultError as verify_exc:
-                            raise SeafileVaultError(redact_secret(str(verify_exc), self.repo_token, upload_link)) from None
+                            raise SeafileVaultError(self._redact(str(verify_exc), upload_link)) from None
                         if info is not None:
                             final_result = {"verified_remote_file": self._safe_final_result(info)}
                             chunks_sent += 1
@@ -2014,7 +2025,7 @@ class SeafileVaultClient:
                             offset = committed
                             break
                     if attempt + 1 >= MAX_CHUNK_ATTEMPTS:
-                        raise SeafileVaultError(redact_secret(str(exc), self.repo_token, upload_link)) from None
+                        raise SeafileVaultError(self._redact(str(exc), upload_link)) from None
                     upload_link = self._validate_upload_url(self._get_upload_link(parent, overwrite=overwrite))
                     time.sleep(0.05 * (attempt + 1))
             else:  # pragma: no cover
@@ -2077,8 +2088,8 @@ class SeafileVaultClient:
         except OSError as exc:
             raise SeafileVaultError(f"direct upload failed to start curl: {exc.strerror or exc}") from None
 
-        stdout = redact_secret(completed.stdout or "", self.repo_token, upload_link)
-        stderr = redact_secret(completed.stderr or "", self.repo_token, upload_link)
+        stdout = self._redact(completed.stdout or "", upload_link)
+        stderr = self._redact(completed.stderr or "", upload_link)
         if completed.returncode != 0:
             detail = stderr[:1000] or stdout[:1000] or "curl failed"
             raise SeafileVaultError(f"direct upload failed (curl exit {completed.returncode}): {detail}")
@@ -2090,7 +2101,7 @@ class SeafileVaultClient:
             raise SeafileVaultError("direct upload failed: curl did not return an HTTP status")
         status = int(status_text)
         if status < 200 or status >= 300:
-            safe_body = redact_secret(body[:1000], self.repo_token, upload_link)
+            safe_body = self._redact(body[:1000], upload_link)
             raise SeafileVaultError(f"Seafile upload HTTP {status}: {safe_body}")
 
     def write_text_file(self, path: str, text: str, *, overwrite: bool = False, encoding: str = "utf-8") -> Any:
