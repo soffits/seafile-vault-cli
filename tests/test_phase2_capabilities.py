@@ -70,6 +70,28 @@ def test_optional_account_token_config_and_launcher_allowlist(tmp_path, monkeypa
     assert seen == [(["repo-info"], "account-secret")]
 
 
+def test_account_token_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("SEAFILE_SERVER_URL", "https://seafile.example.com")
+    monkeypatch.setenv("SEAFILE_REPO_TOKEN", "repo-secret")
+    monkeypatch.delenv("SEAFILE_ACCOUNT_TOKEN", raising=False)
+    token_file = tmp_path / "account-token"
+    token_file.write_text("file-secret\n", encoding="utf-8")
+    monkeypatch.setenv("SEAFILE_ACCOUNT_TOKEN_FILE", str(token_file))
+    assert Config.from_env().account_token == "file-secret"
+
+    monkeypatch.setenv("SEAFILE_ACCOUNT_TOKEN", "account-secret")
+    with pytest.raises(ConfigError):
+        Config.from_env()
+    monkeypatch.delenv("SEAFILE_ACCOUNT_TOKEN")
+
+    token_file.write_text("\n", encoding="utf-8")
+    with pytest.raises(ConfigError):
+        Config.from_env()
+    monkeypatch.setenv("SEAFILE_ACCOUNT_TOKEN_FILE", str(tmp_path / "missing"))
+    with pytest.raises(ConfigError, match="could not be read"):
+        Config.from_env()
+
+
 def test_account_and_repo_headers_are_isolated_and_history_scrubs_repo_ids():
     requests = []
 

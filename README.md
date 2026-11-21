@@ -8,7 +8,7 @@ The tool is built on the idea that whoever uses it can't exceed the token's limi
 
 - `SEAFILE_REPO_TOKEN` is required and maps to one library only. Environment variables are the sole source of tokens; command-line arguments never supply them.
 - `SEAFILE_PERMISSION_MODE` starts at `read_only`. To write, you need `read_write`, and certain writes also require a confirmation flag you set explicitly.
-- `SEAFILE_ACCOUNT_TOKEN` is optional; it comes into play only for thumbnails, for sharing whichever library is current, and for history. The repo token and account token travel in separate headers and are never combined.
+- `SEAFILE_ACCOUNT_TOKEN` is optional; it comes into play only for thumbnails, for sharing whichever library is current, and for history. Instead of the value, `SEAFILE_ACCOUNT_TOKEN_FILE` can name a file holding it (set only one of the two). The repo token and account token travel in separate headers and are never combined.
 - Any remote path must be a POSIX path that is absolute and normalized. The tool rejects `.`, `..`, relative paths, doubled slashes, control characters, and dangerous actions on the library root; it also rejects links from the server that point somewhere unexpected.
 - Links for downloads and uploads have to share the server's origin. Errors and results get scrubbed of passwords, authorization headers, tokens, and URLs that carry tokens.
 - Output drops repo ids, emails for owners and modifiers, lock holders, and other internals no caller needs; it keeps the ids for views, tags, and records that later commands accept.
@@ -77,7 +77,7 @@ seafile-library docs search / --name '*.md'
 seafile-library docs metadata views list
 ```
 
-A profile named `docs` maps only to `docs.env`. Profile files are strict UTF-8 `KEY=VALUE` files, without shell evaluation. The launcher rejects traversal, control characters, symlinks, unsupported keys, duplicate keys, malformed lines, NUL bytes, insecure directory permissions, and env files readable or writable by group/other users. Supported Seafile keys are `SEAFILE_SERVER_URL`, `SEAFILE_REPO_TOKEN`, `SEAFILE_ACCOUNT_TOKEN`, `SEAFILE_PERMISSION_MODE`, size/time limits, chunk settings, and direct-origin upload IP.
+A profile named `docs` maps only to `docs.env`. Profile files are strict UTF-8 `KEY=VALUE` files, without shell evaluation. The launcher rejects traversal, control characters, symlinks, unsupported keys, duplicate keys, malformed lines, NUL bytes, insecure directory permissions, and env files readable or writable by group/other users. Supported Seafile keys are `SEAFILE_SERVER_URL`, `SEAFILE_REPO_TOKEN`, `SEAFILE_ACCOUNT_TOKEN`, `SEAFILE_ACCOUNT_TOKEN_FILE`, `SEAFILE_PERMISSION_MODE`, size/time limits, chunk settings, and direct-origin upload IP.
 
 ## Commands
 

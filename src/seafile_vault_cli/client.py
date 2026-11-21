@@ -453,6 +453,18 @@ def _validated_server_url(raw: str) -> str:
     return server_url
 
 
+def _account_token_from_env() -> str | None:
+    token_file = os.environ.get("SEAFILE_ACCOUNT_TOKEN_FILE")
+    if token_file is None:
+        return os.environ.get("SEAFILE_ACCOUNT_TOKEN")
+    if "SEAFILE_ACCOUNT_TOKEN" in os.environ:
+        raise ConfigError("set only one of SEAFILE_ACCOUNT_TOKEN and SEAFILE_ACCOUNT_TOKEN_FILE")
+    try:
+        return Path(token_file).expanduser().read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError("SEAFILE_ACCOUNT_TOKEN_FILE could not be read") from exc
+
+
 @dataclass(frozen=True)
 class Config:
     server_url: str
@@ -471,13 +483,13 @@ class Config:
     def from_env(cls) -> Config:
         server_url = os.environ.get("SEAFILE_SERVER_URL") or ""
         repo_token = os.environ.get("SEAFILE_REPO_TOKEN") or ""
-        account_token = os.environ.get("SEAFILE_ACCOUNT_TOKEN") if "SEAFILE_ACCOUNT_TOKEN" in os.environ else None
+        account_token = _account_token_from_env()
         if not server_url.strip():
             raise ConfigError("SEAFILE_SERVER_URL is required")
         if not repo_token:
             raise ConfigError("SEAFILE_REPO_TOKEN is required")
         if account_token is not None and not account_token.strip():
-            raise ConfigError("SEAFILE_ACCOUNT_TOKEN must be non-empty when set")
+            raise ConfigError("SEAFILE_ACCOUNT_TOKEN and SEAFILE_ACCOUNT_TOKEN_FILE must be non-empty when set")
         return cls(
             server_url=_validated_server_url(server_url),
             repo_token=repo_token,
